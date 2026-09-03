@@ -20,8 +20,20 @@ Item {
   // "no-token" | "loading" | "ready" | "error"  (not `state`: Item.state is taken)
   property string status: "no-token"
   property string errorText: ""
+  // The full window as the API sees it. Merging and the quiet gate work on this, never on
+  // `tasks`: merging onto the filtered view would drop excluded tasks out of the cache for
+  // good, and clearing the filter would not bring them back until the next full poll.
+  property var allTasks: []
+  // The filtered view every surface reads — the filter applies plugin-wide by construction.
   property var tasks: []
   property var projects: []
+  // Set by the bar widget from its own settings; accepts an array or a comma-separated string.
+  property var excludedProjects: []
+  property int visibleCount: 0
+  property int overdueCount: 0
+  // False while an exclusion list is set but the projects cache is still empty: names cannot
+  // be resolved yet, so the count is the unfiltered one and must not be passed off as filtered.
+  property bool filterApplied: true
   property string lastSync: ""
   signal changed()
 
@@ -55,8 +67,12 @@ Item {
     if (token === "") {
       root.status = "no-token"
       root.errorText = ""
+      root.allTasks = []
       root.tasks = []
       root.projects = []
+      root.visibleCount = 0
+      root.overdueCount = 0
+      root.filterApplied = true
       root.lastSync = ""
       root.changed()
       return
@@ -64,6 +80,41 @@ Item {
     chmodProc.running = true
     root.fullFetchPending = true
     root.refresh()
+  }
+
+  // ---- filtered view -------------------------------------------------
+
+  // Rebuilds `tasks` and the counters from the full window. Returns true when anything
+  // visible actually changed, so callers keep SNG-1's quiet gate instead of emitting
+  // `changed()` on every silent poll.
+  function recompute() {
+    var wanted = Api.normalizeExcluded(root.excludedProjects).size > 0
+    // Tasks carry only projectId, so an exclusion by name needs the projects cache.
+    var applied = !wanted || root.projects.length > 0
+    var next = applied
+      ? Api.applyProjectFilter(root.allTasks, root.projects, root.excludedProjects)
+      : root.allTasks
+    var counts = Api.countWindow(next, new Date())
+    var same = next === root.tasks
+      && counts.total === root.visibleCount
+      && counts.overdue === root.overdueCount
+      && applied === root.filterApplied
+    root.tasks = next
+    root.visibleCount = counts.total
+    root.overdueCount = counts.overdue
+    root.filterApplied = applied
+    return !same
+  }
+
+  onExcludedProjectsChanged: {
+    // A list set before projects have ever arrived would silently do nothing; ask for the
+    // full fetch whose tail carries them.
+    if (Api.normalizeExcluded(root.excludedProjects).size > 0
+        && root.projects.length === 0 && root.apiToken !== "") {
+      root.fullFetchPending = true
+      root.refresh()
+    }
+    if (root.recompute()) root.changed()
   }
 
   // ---- polling -------------------------------------------------------
@@ -134,15 +185,16 @@ Item {
       }
       if (incoming.length >= Api.MAX_COUNT)
         console.warn(root.pluginId + ": task list hit maxCount=" + Api.MAX_COUNT + ", the window may be truncated")
-      var next = Api.merge(taskProc.full ? [] : root.tasks, incoming, now)
-      var quiet = next === root.tasks && root.status === "ready" && root.errorText === ""
-      root.tasks = next
+      var next = Api.merge(taskProc.full ? [] : root.allTasks, incoming, now)
+      var quiet = next === root.allTasks && root.status === "ready" && root.errorText === ""
+      root.allTasks = next
       root.lastRequestStartedAt = taskProc.startedAt
       root.lastSync = now.toISOString()
       if (taskProc.full) root.lastFullFetchDay = root.dayKey(new Date(taskProc.startedAt))   // the query window was built at request start
       root.errorText = ""
       root.status = "ready"
-      if (!quiet) root.changed()
+      var visibleChanged = root.recompute()
+      if (!quiet || visibleChanged) root.changed()
       if (taskProc.full) {
         root.runAuthedCurl(projectProc, Api.buildUrl("/v2/project", Api.projectsQuery()))
       } else {
@@ -175,6 +227,7 @@ Item {
         }
       }
       root.inFlight = false
+      root.recompute()   // names become resolvable only now, on the first full poll
       root.changed()
       root.drainPending()
     }
@@ -225,8 +278,24 @@ Item {
         errorText: root.errorText,
         tasks: root.tasks,
         projects: root.projects,
+        visibleCount: root.visibleCount,
+        overdueCount: root.overdueCount,
+        excludedProjects: root.excludedProjects,
+        filterApplied: root.filterApplied,
         lastSync: root.lastSync,
         inFlight: root.inFlight
+      })
+    }
+
+    // Write side. Until the bar widget exists the list has no other source, so without this
+    // the filter cannot be exercised at all outside a running shell.
+    function exclude(names: string): string {
+      root.excludedProjects = names
+      return JSON.stringify({
+        excludedProjects: root.excludedProjects,
+        visibleCount: root.visibleCount,
+        overdueCount: root.overdueCount,
+        filterApplied: root.filterApplied
       })
     }
 
