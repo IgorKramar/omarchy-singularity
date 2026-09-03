@@ -10,5 +10,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Manifest is valid JSON
-        run: python3 -c 'import json; m = json.load(open("manifest.json")); print(m["id"], m["version"], m["kinds"])'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Api.mjs unit tests
+        run: node --test
+
+      - name: Plugin manifest and entry points (vendored omarchy-plugin-validate)
+        run: bash test/omarchy-plugin-validate "$PWD"
