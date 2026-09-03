@@ -4,7 +4,8 @@ import {
   BASE_URL, MAX_COUNT, TASK_FIELDS,
   endOfDay, startOfDay, todayQuery, incrementalQuery, projectsQuery,
   buildUrl, parseTasks, parseProjects, merge, isCurrent,
-  isOverdue, normalizeExcluded, applyProjectFilter, countWindow
+  isOverdue, normalizeExcluded, applyProjectFilter, countWindow,
+  computeView, excludedList
 } from "../Api.mjs"
 
 // Фиксированный «сейчас»: 3 сентября 2026, полдень, локальная зона машины.
@@ -212,4 +213,78 @@ test("countWindow считает просрочку заново: тот же н
   const nextDay = new Date(2026, 8, 4, 12)
   assert.deepEqual(countWindow(tasks, nextDay), { total: 1, overdue: 1 },
     "на следующие сутки та же задача просрочена, хотя признак в объекте не менялся")
+})
+
+// --- Вид и тихий гейт (SNG-2, находки ревью кода) ---
+// Пять ревьюеров независимо нашли одно: отсев отдаёт новый массив каждый раз, когда что-то
+// выбрасывает, поэтому сравнение по ссылке на стороне сервиса объявляло изменение на каждом
+// опросе — ровно у тех, кто фильтр настроил. Ниже тесты на само это свойство.
+
+test("отсев на пути отбрасывания строит новый массив каждый вызов — сравнивать по ссылке нельзя", () => {
+  const first = applyProjectFilter(window8, projects, ["Дни рождения"])
+  const second = applyProjectFilter(window8, projects, ["Дни рождения"])
+  assert.notEqual(first, second, "это и есть контракт, под который обязан подстраиваться вызывающий")
+  assert.deepEqual(first.map((t) => t.id), second.map((t) => t.id))
+})
+
+test("название совпало с проектом, у которого нет задач в окне — исходный массив той же ссылкой", () => {
+  // Единственная форма входа, попадающая во вторую половину тернарника в applyProjectFilter.
+  assert.equal(applyProjectFilter(window8, projects, ["Работа"]), window8)
+})
+
+test("computeView: повторный вызов на неизменном окне возвращает прежнюю ссылку — гейт держится", () => {
+  let view = computeView([], window8, projects, ["Дни рождения"], now)
+  assert.equal(view.tasks.length, 3)
+  const settled = view.tasks
+  for (let i = 0; i < 3; i++) {
+    view = computeView(view.tasks, window8, projects, ["Дни рождения"], now)
+    assert.equal(view.tasks, settled, "тихий опрос не должен подменять ссылку")
+  }
+})
+
+test("computeView: изменение окна ссылку меняет", () => {
+  const view = computeView([], window8, projects, ["Дни рождения"], now)
+  const shorter = computeView(view.tasks, window8.slice(0, 6), projects, ["Дни рождения"], now)
+  assert.notEqual(shorter.tasks, view.tasks)
+  assert.equal(shorter.total, 1)
+})
+
+test("computeView: пустой кэш проектов при непустом списке — отсев не применён", () => {
+  const view = computeView([], window8, [], ["Дни рождения"], now)
+  assert.equal(view.applied, false, "сопоставлять название не с чем")
+  assert.equal(view.tasks, window8, "окно отдаётся как есть, а не как отфильтрованное")
+  assert.equal(view.total, 8)
+  assert.equal(view.excludedCount, 1)
+})
+
+test("computeView: пустой список исключаемых считается применённым", () => {
+  const view = computeView([], window8, [], [], now)
+  assert.equal(view.applied, true)
+  assert.equal(view.excludedCount, 0)
+})
+
+test("computeView: счётчики берутся из отсеянного набора, а не из полного окна", () => {
+  const mixed = parseTasks(body([
+    task({ id: "O-1", projectId: "P-1", start: yesterday }),
+    task({ id: "O-2", projectId: "P-3", start: yesterday }),
+    task({ id: "T-1", projectId: "P-3", start: today })
+  ]), now)
+  const view = computeView([], mixed, projects, ["Дни рождения"], now)
+  assert.deepEqual({ total: view.total, overdue: view.overdue }, { total: 2, overdue: 1 })
+})
+
+test("excludedList: массив и строка дают один и тот же список одной формы", () => {
+  assert.deepEqual(excludedList("Дни рождения, Работа"), ["дни рождения", "работа"])
+  assert.deepEqual(excludedList([" Дни рождения ", "РАБОТА"]), ["дни рождения", "работа"])
+  assert.deepEqual(excludedList(undefined), [])
+})
+
+test("normalizeExcluded сверяется с ожидаемым набором, а не сам с собой", () => {
+  assert.deepEqual(normalizeExcluded(" Дни Рождения , работа "), new Set(["дни рождения", "работа"]))
+})
+
+test("isOverdue: задача без start и пустой аргумент не роняют функцию", () => {
+  assert.equal(isOverdue({ start: null }, now), false)
+  assert.equal(isOverdue(null, now), false)
+  assert.equal(isOverdue(undefined, now), false)
 })

@@ -22,6 +22,7 @@ BarWidget {
   readonly property int visibleCount: svc ? svc.visibleCount : 0
   readonly property int overdueCount: svc ? svc.overdueCount : 0
   readonly property bool filterApplied: svc ? svc.filterApplied : true
+  readonly property int excludedCount: svc ? svc.excludedCount : 0
 
   // The exclusion list lives in this widget's shell.json entry and is handed to the service,
   // which applies it to its own cache — so every surface of the plugin sees the same set.
@@ -56,8 +57,14 @@ BarWidget {
       ? "SingularityApp — всё чисто"
       : "SingularityApp — просрочено " + root.overdueCount
         + ", сегодня " + (root.visibleCount - root.overdueCount)
-    // Without this the unfiltered count would silently pass for a filtered one.
+    // Both directions have to be visible. Without the first line an unfiltered count would
+    // pass for a filtered one; without the second, a day emptied by the filter would look
+    // exactly like a day that was genuinely empty.
     if (!root.filterApplied) text += ". Отсев не применён: список проектов ещё не загружен"
+    else if (root.excludedCount > 0) text += ". Отсев: проектов " + root.excludedCount
+    // A failed project fetch keeps status at "ready" by design, so it is invisible unless
+    // named here.
+    if (svc.errorText) text += ". " + svc.errorText
     return text
   }
 

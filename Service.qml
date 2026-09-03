@@ -34,6 +34,7 @@ Item {
   // False while an exclusion list is set but the projects cache is still empty: names cannot
   // be resolved yet, so the count is the unfiltered one and must not be passed off as filtered.
   property bool filterApplied: true
+  property int excludedCount: 0
   property string lastSync: ""
   signal changed()
 
@@ -73,6 +74,7 @@ Item {
       root.visibleCount = 0
       root.overdueCount = 0
       root.filterApplied = true
+      root.excludedCount = 0
       root.lastSync = ""
       root.changed()
       return
@@ -86,23 +88,23 @@ Item {
 
   // Rebuilds `tasks` and the counters from the full window. Returns true when anything
   // visible actually changed, so callers keep SNG-1's quiet gate instead of emitting
-  // `changed()` on every silent poll.
+  // `changed()` on every silent poll. The view — including whether it counts as unchanged —
+  // is computed by Api.computeView, where `node --test` can reach it; this function only
+  // assigns. Deciding equality here was the bug: the filter hands back a fresh array
+  // whenever it drops anything, so an identity check reported a change on every poll.
   function recompute() {
-    var wanted = Api.normalizeExcluded(root.excludedProjects).size > 0
-    // Tasks carry only projectId, so an exclusion by name needs the projects cache.
-    var applied = !wanted || root.projects.length > 0
-    var next = applied
-      ? Api.applyProjectFilter(root.allTasks, root.projects, root.excludedProjects)
-      : root.allTasks
-    var counts = Api.countWindow(next, new Date())
-    var same = next === root.tasks
-      && counts.total === root.visibleCount
-      && counts.overdue === root.overdueCount
-      && applied === root.filterApplied
-    root.tasks = next
-    root.visibleCount = counts.total
-    root.overdueCount = counts.overdue
-    root.filterApplied = applied
+    var view = Api.computeView(root.tasks, root.allTasks, root.projects,
+                               root.excludedProjects, new Date())
+    var same = view.tasks === root.tasks
+      && view.total === root.visibleCount
+      && view.overdue === root.overdueCount
+      && view.applied === root.filterApplied
+      && view.excludedCount === root.excludedCount
+    root.tasks = view.tasks
+    root.visibleCount = view.total
+    root.overdueCount = view.overdue
+    root.filterApplied = view.applied
+    root.excludedCount = view.excludedCount
     return !same
   }
 
@@ -276,23 +278,29 @@ Item {
       return JSON.stringify({
         status: root.status,
         errorText: root.errorText,
+        // `tasks` is the filtered view every surface reads; `allTasks` is the full window,
+        // published beside it because the meaning of `tasks` changed in SNG-2.
         tasks: root.tasks,
+        allTasks: root.allTasks,
         projects: root.projects,
         visibleCount: root.visibleCount,
         overdueCount: root.overdueCount,
-        excludedProjects: root.excludedProjects,
+        // Always the effective list, never the raw setting: the raw value is an array or a
+        // comma string depending on who wrote it, and consumers should not have to care.
+        excludedProjects: Api.excludedList(root.excludedProjects),
         filterApplied: root.filterApplied,
         lastSync: root.lastSync,
         inFlight: root.inFlight
       })
     }
 
-    // Write side. Until the bar widget exists the list has no other source, so without this
-    // the filter cannot be exercised at all outside a running shell.
+    // Write side, deliberately transient: the bar widget re-pushes its shell.json value on
+    // the next settings change, so this overrides the filter for the session and no longer.
+    // It stays because it is the only way to exercise the filter without editing shell.json.
     function exclude(names: string): string {
       root.excludedProjects = names
       return JSON.stringify({
-        excludedProjects: root.excludedProjects,
+        excludedProjects: Api.excludedList(root.excludedProjects),
         visibleCount: root.visibleCount,
         overdueCount: root.overdueCount,
         filterApplied: root.filterApplied
