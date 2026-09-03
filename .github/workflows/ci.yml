@@ -15,6 +15,10 @@ jobs:
           node-version: 22
 
       - name: Api.mjs unit tests
+        # Фиксированная зона UTC+6 без перехода на летнее время: регрессия на смещение
+        # дат утверждает конкретную дату и на раннере в UTC была бы ложной.
+        env:
+          TZ: Asia/Omsk
         run: node --test
 
       - name: Plugin manifest and entry points (vendored omarchy-plugin-validate)
