@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.igorkramar.singularity",
+  "name": "SingularityApp",
+  "version": "0.1.0",
+  "author": "Igor Kramar",
+  "license": "MIT",
+  "description": "SingularityApp tasks in the bar: today's count pill, a rich popup, and a full-screen overlay with tasks, habits and time tracking.",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "overlay": "Overlay.qml"
+  },
+  "barWidget": {
+    "displayName": "SingularityApp",
+    "description": "Count of today's and overdue tasks, with a popup to check them off and add new ones.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
