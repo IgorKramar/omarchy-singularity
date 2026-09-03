@@ -67,6 +67,14 @@ function parseJson(text) {
   }
 }
 
+// A task is overdue when its start is before the local start of today. Shared by
+// normalizeTask (which freezes it at parse time) and countWindow (which recomputes it),
+// so the two never drift apart.
+export function isOverdue(task, now) {
+  const start = task && task.start
+  return !!start && new Date(start).getTime() < startOfDay(now).getTime()
+}
+
 function normalizeTask(t, now) {
   const start = t.start || null
   return {
@@ -81,7 +89,7 @@ function normalizeTask(t, now) {
     deleteDate: t.deleteDate || null,
     removed: t.removed === true,
     modifiedAt: t.modificatedDate || null,
-    overdue: start !== null && new Date(start).getTime() < startOfDay(now).getTime()
+    overdue: isOverdue({ start }, now)
   }
 }
 
@@ -119,4 +127,45 @@ export function merge(cache, incoming, now) {
 
 function sameTasks(a, b) {
   return a.length === b.length && a.every((t, i) => JSON.stringify(t) === JSON.stringify(b[i]))
+}
+
+// --- Project filter and counters (SNG-2) ---
+
+// The setting is written by hand in shell.json, so accept both an array and a
+// comma-separated string. Comparison is trimmed and case-insensitive.
+export function normalizeExcluded(value) {
+  const items = Array.isArray(value) ? value
+    : typeof value === "string" ? value.split(",")
+    : []
+  // Only strings: shell.json is hand-edited, and String(null) would otherwise become
+  // the key "null" and exclude a project actually named that.
+  return new Set(items
+    .filter((s) => typeof s === "string")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s !== ""))
+}
+
+// Tasks carry only projectId, so names are resolved through the projects cache. An empty
+// cache therefore means "no filtering possible" — the caller must treat that as not-applied
+// rather than as a clean result. A task without a project is never excluded (R6).
+// Matching by name excludes every project sharing that name; it does not descend into
+// subprojects (KTD2). Returns the same array reference when nothing is dropped, so the
+// service's quiet gate does not fire on an unchanged set.
+export function applyProjectFilter(tasks, projects, excluded) {
+  const names = normalizeExcluded(excluded)
+  if (names.size === 0) return tasks
+  const excludedIds = new Set(
+    projects.filter((p) => names.has(String(p.title || "").trim().toLowerCase())).map((p) => String(p.id))
+  )
+  if (excludedIds.size === 0) return tasks
+  const next = tasks.filter((t) => !t.projectId || !excludedIds.has(String(t.projectId)))
+  return next.length === tasks.length ? tasks : next
+}
+
+// Recomputes overdue from start and now instead of reading the flag frozen at parse time:
+// after midnight the frozen split is a day stale until the next full poll.
+export function countWindow(tasks, now) {
+  let overdue = 0
+  for (const t of tasks) if (isOverdue(t, now)) overdue += 1
+  return { total: tasks.length, overdue }
 }
