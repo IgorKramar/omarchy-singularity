@@ -19,7 +19,9 @@ jobs:
         # дат утверждает конкретную дату и на раннере в UTC была бы ложной.
         env:
           TZ: Asia/Omsk
-        run: node --test
+        # Файл назван явно: node --test, не найдя ни одного файла, уходит нулём —
+        # переименование теста оставило бы джоб зелёным при нуле проверок.
+        run: node --test test/api.test.mjs
 
       - name: Plugin manifest and entry points (vendored omarchy-plugin-validate)
         run: bash test/omarchy-plugin-validate "$PWD"

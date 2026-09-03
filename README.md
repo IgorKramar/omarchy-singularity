@@ -70,11 +70,16 @@ one always works:
    section that holds the widget:
 
    ```json
-   { "module": "io.github.igorkramar.singularity",
+   { "id": "io.github.igorkramar.singularity",
      "excludedProjects": "Birthdays, Public holidays" }
    ```
 
-   The shell watches the file, so the count changes without a restart.
+   Add the key to the widget's existing entry — the entry is keyed by `id`, and the shell
+   resolves bar entries by that field alone. The shell watches the file, so the count
+   changes without a restart.
+
+   Every bar entry for this widget feeds one service, so on a multi-monitor setup the last
+   entry to load wins. Give them all the same `excludedProjects`.
 
 2. **The settings form**, if you have the third-party
    [`plugin-control-center`](https://github.com/brm-src/omarchy-plugin-control-center) plugin.
@@ -95,9 +100,14 @@ Three consequences worth knowing:
 Check what the service actually has:
 
 ```bash
-omarchy-shell singularity status                       # visibleCount, overdueCount, excludedProjects, filterApplied
-omarchy-shell singularity exclude "Birthdays"          # set the list without touching shell.json
+omarchy-shell singularity status                  # visibleCount, overdueCount, excludedProjects, filterApplied
+omarchy-shell singularity exclude "Birthdays"     # transient override, for checking the filter
 ```
+
+`status` reports `tasks` (the filtered view every surface reads) beside `allTasks` (the full
+window), so you can see what the filter removed. `exclude` is **not persisted**: the widget
+re-pushes its `shell.json` value on the next settings change, so anything you want to keep
+goes in the file.
 
 `filterApplied` is `false` when a list is set but the project cache has not arrived yet: names
 cannot be resolved, so the count you see is the unfiltered one. The pill says so in its tooltip
@@ -116,7 +126,7 @@ Validate from the checkout, not through the symlink — the validator treats a s
 
 ```bash
 omarchy plugin validate "$PWD"
-node --test                       # Api.mjs unit tests, the same step CI runs
+TZ=Asia/Omsk node --test          # Api.mjs unit tests, the same step CI runs
 ```
 
 `Api.mjs` is a plain ES module shared by QML and Node. The `qml` on `PATH` is Qt 5 and cannot load it; use `/usr/lib/qt6/bin/qml` for local QML checks.

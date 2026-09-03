@@ -169,3 +169,31 @@ export function countWindow(tasks, now) {
   for (const t of tasks) if (isOverdue(t, now)) overdue += 1
   return { total: tasks.length, overdue }
 }
+
+// Element identity, not deep equality: both arrays hold the very objects merge() put in the
+// cache, and a quiet merge hands that same cache back untouched.
+function sameOrder(a, b) {
+  return a.length === b.length && a.every((t, i) => t === b[i])
+}
+
+// The whole visible view in one pure, testable place. Equality must NOT be decided by the
+// caller: applyProjectFilter allocates a fresh array whenever it actually drops something,
+// so an identity check on the caller's side would report a change on every poll and defeat
+// the quiet gate — precisely for the users who configured a filter. `prev` is the previously
+// published view; the result reuses that reference when the content is unchanged.
+export function computeView(prev, allTasks, projects, excluded, now) {
+  const names = normalizeExcluded(excluded)
+  // Tasks carry only projectId, so resolving a name needs the projects cache. An empty cache
+  // with a non-empty list is "not applied", not a clean result.
+  const applied = names.size === 0 || projects.length > 0
+  let tasks = applied ? applyProjectFilter(allTasks, projects, excluded) : allTasks
+  if (tasks !== prev && sameOrder(prev, tasks)) tasks = prev
+  const { total, overdue } = countWindow(tasks, now)
+  return { tasks, total, overdue, applied, excludedCount: names.size }
+}
+
+// The effective list, type-stable whether the setting arrived as an array or a comma string,
+// so IPC consumers see one shape instead of whatever the last writer happened to use.
+export function excludedList(value) {
+  return [...normalizeExcluded(value)]
+}
