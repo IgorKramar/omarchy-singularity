@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "Igor Kramar",
   "license": "MIT",
-  "description": "SingularityApp tasks in the bar: today's count pill, a rich popup, and a full-screen overlay with tasks, habits and time tracking.",
+  "description": "SingularityApp tasks in the bar: a count pill for today and overdue, with a per-project filter. A popup and a full-screen overlay follow.",
   "kinds": [
     "service",
     "bar-widget",
@@ -19,9 +19,21 @@
   },
   "barWidget": {
     "displayName": "SingularityApp",
-    "description": "Count of today's and overdue tasks, with a popup to check them off and add new ones.",
+    "description": "Count of today's and overdue tasks. Projects listed in the filter are left out of the count everywhere in the plugin.",
     "category": "Productivity",
     "allowMultiple": false,
-    "defaultSection": "right"
+    "defaultSection": "right",
+    "defaults": {
+      "excludedProjects": ""
+    },
+    "schema": [
+      {
+        "key": "excludedProjects",
+        "type": "string",
+        "label": "Не считать проекты",
+        "defaultValue": "",
+        "description": "Названия через запятую, как они видны в SingularityApp — например: Дни рождения, Праздники и поздравления. Именно названия, а не идентификаторы: файл настроек правится руками. Регистр и лишние пробелы не важны; правило срабатывает на всех одноимённых проектах и не распространяется на подпроекты."
+      }
+    ]
   }
 }

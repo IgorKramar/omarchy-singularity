@@ -6,7 +6,8 @@
 ![Omarchy](https://img.shields.io/badge/Omarchy-shell%20plugin-7aa2f7)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
-> **Status: in development.** Nothing to install yet — the plugin is being built surface by surface.
+> **Status: in development.** The bar pill and the headless service work; the popup and the
+> overlay are not built yet.
 
 ## What it will be
 
@@ -53,6 +54,54 @@ The service watches the file, so a token placed after the shell started is picke
 omarchy-shell singularity status    # {"status":"no-token"|"loading"|"ready"|"error", "errorText":…, "tasks":[…], …}
 omarchy-shell singularity refresh   # force a full fetch
 ```
+
+### Filtering projects out of the count
+
+Some projects are noise in a count: annual birthdays, public holidays, anything that recurs
+forever and needs no action today. List them and they stop counting.
+
+The filter is applied by the service, not by the pill, so it holds for every surface of the
+plugin — the popup and the overlay will show the same set the count is taken from.
+
+**Omarchy has no built-in settings screen.** There are two ways to set the list, and the first
+one always works:
+
+1. **Edit the widget's entry in `shell.json`** (`~/.config/omarchy/shell.json`), under the bar
+   section that holds the widget:
+
+   ```json
+   { "module": "io.github.igorkramar.singularity",
+     "excludedProjects": "Birthdays, Public holidays" }
+   ```
+
+   The shell watches the file, so the count changes without a restart.
+
+2. **The settings form**, if you have the third-party
+   [`plugin-control-center`](https://github.com/brm-src/omarchy-plugin-control-center) plugin.
+   The manifest declares the schema for it; without that plugin nothing renders the form, which
+   is why the first way is not optional.
+
+Projects are matched **by name, not by id** — an id like `P-81478cf7-…` is not something you
+would type into a file by hand. Comparison ignores case and surrounding spaces. A comma-separated
+string and a JSON array are both accepted.
+
+Three consequences worth knowing:
+
+- Renaming a project in SingularityApp silently switches its exclusion off. The count goes up;
+  fix the name in the file.
+- A name matches **every** project that carries it. SingularityApp does not promise unique names.
+- Excluding a parent does **not** exclude its subprojects. List them too.
+
+Check what the service actually has:
+
+```bash
+omarchy-shell singularity status                       # visibleCount, overdueCount, excludedProjects, filterApplied
+omarchy-shell singularity exclude "Birthdays"          # set the list without touching shell.json
+```
+
+`filterApplied` is `false` when a list is set but the project cache has not arrived yet: names
+cannot be resolved, so the count you see is the unfiltered one. The pill says so in its tooltip
+rather than passing the larger number off as filtered.
 
 ## Development
 
