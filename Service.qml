@@ -124,6 +124,11 @@ Item {
   function refresh() {
     if (root.apiToken === "") return
     if (root.inFlight) { root.refreshPending = true; return }
+    // A poll started now would race a mutation already in flight: merge is last-writer-wins
+    // by id with no modified-time comparison, so a poll that began before the checkbox and
+    // arrives after its response puts the pre-completion task straight back in the window.
+    // The user would watch a completed task reappear and the numbers roll back.
+    if (root.mutationQueue.length > 0 || root.mutatingId !== "") { root.refreshPending = true; return }
     var now = new Date()
     var today = root.dayKey(now)
     var full = root.fullFetchPending || root.lastSync === "" || root.lastFullFetchDay !== today
@@ -136,13 +141,21 @@ Item {
     root.runAuthedCurl(taskProc, Api.buildUrl("/v2/task", params))
   }
 
-  // The token goes to curl over stdin as a `-K -` config line, never as an argument.
-  function runAuthedCurl(proc, url) {
-    proc.command = ["curl", "-fsS", "--max-time", "15", "-K", "-", url]
+  // The whole request — token, verb, headers, body — goes to curl as a `-K -` config on
+  // stdin. Nothing reaches argv, where /proc/<pid>/cmdline would expose both the token and
+  // whatever the user typed to every process on the machine. Both the command array and
+  // the config text are built by pure functions in Api.mjs so that property is pinned by a
+  // test rather than by one look at a process that lives half a second.
+  function runAuthedRequest(proc, url, method, bodyOrNull) {
+    proc.command = Api.buildRequestCommand(url)
     proc.stdinEnabled = true
     proc.running = true
-    proc.write("header = \"Authorization: Bearer " + root.apiToken + "\"\n")
+    proc.write(Api.buildCurlConfig(root.apiToken, method, bodyOrNull))
     proc.stdinEnabled = false   // curl reads the config until EOF
+  }
+
+  function runAuthedCurl(proc, url) {
+    root.runAuthedRequest(proc, url, "GET", null)
   }
 
   function finishWithError(text) {
@@ -151,6 +164,114 @@ Item {
     root.inFlight = false
     root.changed()
     root.drainPending()
+  }
+
+
+  // ---- mutations -----------------------------------------------------
+  //
+  // Writes get their own process, their own busy flag and their own error text. Routing
+  // them through the poll's `finishWithError` would set `status: "error"` and clear
+  // `inFlight` mid-poll — one checkbox that failed to save would repaint the whole popup
+  // as a broken service and could start a second concurrent poll through drainPending.
+
+  property var mutationQueue: []      // {id, op, title} entries, oldest first
+  property string mutatingId: ""      // the entry currently in flight, "" when idle
+  property var pendingIds: []         // ids the interface should draw as "sent"
+  property string mutationError: ""   // raw text; the popup classifies it, never shows it
+  property double lastMutationAt: 0   // guards the poll response that started before it
+  signal mutated(string id, string op)
+
+  function enqueueMutation(op, id, title) {
+    if (root.apiToken === "") return false
+    if (id !== "" && root.pendingIds.indexOf(id) !== -1) return false   // already sent
+    // Validate before queueing, not while draining: a blank title rejected downstream
+    // still answered the caller "ok" for something that was never going to be sent.
+    if (op === "create" && Api.buildCreateBody(title, new Date()) === null) return false
+    if (op === "rename" && Api.buildRenameBody(title) === null) return false
+    var q = root.mutationQueue.slice()
+    q.push({ id: id, op: op, title: title || "" })
+    root.mutationQueue = q
+    if (id !== "") root.pendingIds = root.pendingIds.concat([id])
+    root.mutationError = ""
+    root.drainMutations()
+    return true
+  }
+
+  function drainMutations() {
+    if (root.mutatingId !== "" || root.mutationQueue.length === 0) return
+    if (root.apiToken === "") { root.abandonMutations(); return }
+    var q = root.mutationQueue.slice()
+    var entry = q.shift()
+    root.mutationQueue = q
+    root.mutatingId = entry.id === "" ? "new" : entry.id
+    mutationProc.entryId = entry.id
+    mutationProc.op = entry.op
+
+    var now = new Date()
+    var spec = Api.MUTATIONS[entry.op](entry.id)
+    var body = entry.op === "create" ? Api.buildCreateBody(entry.title, now)
+      : entry.op === "rename" ? Api.buildRenameBody(entry.title) : null
+    root.runAuthedRequest(mutationProc, Api.BASE_URL + spec.path, spec.method, body)
+  }
+
+  // Every exit funnels here — success, non-zero code, an empty token, a timeout. A path
+  // that forgets to call it leaves the checkbox drawn as "sent" forever and stops the
+  // queue silently, and the only cure would be restarting the shell.
+  function finishMutation(id, ok) {
+    if (id !== "") root.pendingIds = root.pendingIds.filter(function(x) { return x !== id })
+    root.mutatingId = ""
+    if (ok) root.lastMutationAt = Date.now()
+    root.changed()
+    Qt.callLater(root.drainMutations)
+    // A poll deferred while writes were running still owes us fresh data.
+    if (root.mutationQueue.length === 0) Qt.callLater(root.drainPending)
+  }
+
+  function abandonMutations() {
+    root.mutationQueue = []
+    root.pendingIds = []
+    root.mutatingId = ""
+    root.mutationError = ""
+  }
+
+  function complete(id) { return root.enqueueMutation("complete", id, "") }
+  function rename(id, title) { return root.enqueueMutation("rename", id, title) }
+  function add(title) { return root.enqueueMutation("create", "", title) }
+
+  Process {
+    id: mutationProc
+    property string entryId: ""
+    property string op: ""
+    stdout: StdioCollector { id: mutationOut; waitForEnd: true }
+    stderr: StdioCollector { id: mutationErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var id = mutationProc.entryId
+      if (root.apiToken === "") {   // token removed mid-flight: no-token stays the truth
+        root.abandonMutations()
+        return
+      }
+      if (exitCode !== 0) {
+        var msg = String(mutationErr.text || "").trim()
+        root.mutationError = msg !== "" ? msg : "curl exited with code " + exitCode
+        root.finishMutation(id, false)
+        return
+      }
+      var task
+      try {
+        task = Api.parseTask(mutationOut.text, new Date())
+      } catch (e) {
+        root.mutationError = String(e.message || e)
+        root.finishMutation(id, false)
+        return
+      }
+      // The response is the task itself, so it goes through the same merge as a poll:
+      // isCurrent already drops a completed task, so the window needs no new filter.
+      root.allTasks = Api.merge(root.allTasks, [task], new Date())
+      root.mutationError = ""
+      root.recompute()
+      root.mutated(task.id, mutationProc.op)
+      root.finishMutation(id, true)
+    }
   }
 
   function drainPending() {
@@ -175,6 +296,16 @@ Item {
       if (exitCode !== 0) {
         var msg = String(taskErr.text || "").trim()
         root.finishWithError(msg !== "" ? msg : "curl exited with code " + exitCode)
+        return
+      }
+      // This response left the server before the last mutation landed, so it describes a
+      // world where that mutation had not happened. Merging it would put the completed
+      // task back in the window and roll the numbers back — a coherent, false picture the
+      // user would have to wait out. Throw it away and ask again.
+      if (taskProc.startedAt < root.lastMutationAt) {
+        root.inFlight = false
+        root.refreshPending = true
+        root.drainPending()
         return
       }
       var now = new Date()
@@ -305,6 +436,18 @@ Item {
         overdueCount: root.overdueCount,
         filterApplied: root.filterApplied
       })
+    }
+
+    function complete(id: string): string {
+      return root.complete(id) ? "ok" : "rejected"
+    }
+
+    function add(title: string): string {
+      return root.add(title) ? "ok" : "rejected"
+    }
+
+    function rename(id: string, title: string): string {
+      return root.rename(id, title) ? "ok" : "rejected"
     }
 
     function refresh(): string {
