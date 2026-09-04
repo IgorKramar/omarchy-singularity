@@ -10,7 +10,9 @@ import {
   moveCursor, cursorIndexForId, popupView,
   errorClass, unmatchedExcluded, emptyReason,
   toggleKey, isStale, priorityLabel, footerState,
-  parseNote, taskFields, recurrenceState, taskWebUrl, WEB_BASE
+  parseNote, taskFields, recurrenceState, taskWebUrl, WEB_BASE,
+  MUTATIONS, escapeCurlConfigValue, buildCurlConfig, buildRequestCommand,
+  buildCreateBody, buildRenameBody, parseTask
 } from "../Api.mjs"
 
 // Фиксированный «сейчас»: 3 сентября 2026, полдень, локальная зона машины.
@@ -73,8 +75,11 @@ test("parseTasks: flat list with overdue flag", () => {
     task({ id: "C", start: null })
   ]), now)
   assert.deepEqual(out.map(t => [t.id, t.overdue]), [["A", true], ["B", false], ["C", false]])
+  // Форма кэшируемой задачи закреплена целиком: поле, добавленное в запрашиваемые и
+  // забытое здесь, приходило бы из API и молча пропадало.
   assert.deepEqual(Object.keys(out[0]).sort(),
-    ["checked", "deadline", "deferred", "deleteDate", "id", "modifiedAt", "overdue", "priority", "projectId", "removed", "start", "title"])
+    ["checked", "deadline", "deferred", "deleteDate", "id", "modifiedAt", "note", "overdue",
+     "priority", "projectId", "recurrence", "recurrenceGeneratorId", "removed", "start", "title"])
 })
 
 test("parseTasks throws on non-JSON and on unexpected shape", () => {
@@ -742,4 +747,98 @@ test("parseNote: разобранная пустышка — это пустая
   // пометка «не удалось прочитать» здесь была бы ложной тревогой.
   assert.deepEqual(parseNote('[{"insert":"\\n"}]'), { text: "", state: "empty" })
   assert.deepEqual(parseNote('[{"insert":"   "}]'), { text: "", state: "empty" })
+})
+
+// ---- U3: поверхность записи ----------------------------------------------
+
+test("buildRequestCommand не несёт ни токена, ни содержимого", () => {
+  // Главное защитное свойство: /proc/<pid>/cmdline читает всякий процесс в системе.
+  const cmd = buildRequestCommand("https://api.singularity-app.com/v2/task")
+  const joined = cmd.join(" ")
+  assert.ok(!joined.includes("Bearer"), "заголовка авторизации в argv быть не должно")
+  assert.ok(cmd.includes("-K") && cmd.includes("-"), "запрос читается из конфигурации на stdin")
+  assert.deepEqual(cmd.filter((a) => a.startsWith("http")), ["https://api.singularity-app.com/v2/task"])
+})
+
+test("escapeCurlConfigValue закрывает инъекцию через кавычку", () => {
+  assert.equal(escapeCurlConfigValue('с "кавычкой"'), 'с \\"кавычкой\\"')
+  assert.equal(escapeCurlConfigValue("с \\ косой"), "с \\\\ косой")
+  assert.equal(escapeCurlConfigValue('обе \\ и "'), 'обе \\\\ и \\"')
+  // Сырой перевод строки создал бы в конфигурации вторую директиву — на том же
+  // канале, которым едет токен. JSON.stringify его сюда не пропустит, но проволока стоит.
+  assert.throws(() => escapeCurlConfigValue("две\nстроки"), /CR or LF/)
+  assert.throws(() => escapeCurlConfigValue("возврат\rкаретки"), /CR or LF/)
+})
+
+test("buildCurlConfig: название с кавычкой не порождает лишней директивы", () => {
+  const cfg = buildCurlConfig("TOK", "POST", { title: 'а "б" \\ в' })
+  const lines = cfg.trimEnd().split("\n")
+  assert.equal(lines.length, 4, "ровно четыре строки: токен, глагол, тип, тело")
+  assert.ok(lines[0].startsWith('header = "Authorization: Bearer TOK"'))
+  assert.equal(lines[1], 'request = "POST"')
+  assert.ok(lines[3].startsWith('data = "'))
+  // Тело внутри значения — валидный JSON после снятия экранирования конфигурации.
+  const raw = lines[3].slice('data = "'.length, -1).replace(/\\"/g, '"').replace(/\\\\/g, "\\")
+  assert.deepEqual(JSON.parse(raw), { title: 'а "б" \\ в' })
+})
+
+test("buildCurlConfig: читающий запрос остаётся частным случаем без тела", () => {
+  const cfg = buildCurlConfig("TOK", "GET", null)
+  assert.equal(cfg.trimEnd().split("\n").length, 1, "только заголовок авторизации")
+  assert.ok(!cfg.includes("Content-Type"))
+})
+
+test("buildCreateBody кладёт задачу во Входящие на сегодня", () => {
+  const b = buildCreateBody("  купить саморезы  ", now)
+  assert.equal(b.title, "купить саморезы", "название обрезано по краям")
+  assert.match(b.start, /^2026-09-03T09:00:00[+-]\d\d:\d\d$/)
+  assert.ok(!("projectId" in b), "Входящие — это отсутствие проекта, а не проект")
+  assert.equal(buildCreateBody("", now), null)
+  assert.equal(buildCreateBody("   ", now), null)
+  assert.equal(buildCreateBody(null, now), null)
+})
+
+test("buildRenameBody несёт только название", () => {
+  assert.deepEqual(buildRenameBody("  новое имя "), { title: "новое имя" })
+  assert.equal(buildRenameBody("  "), null)
+})
+
+test("MUTATIONS кодирует идентификатор в пути", () => {
+  assert.equal(MUTATIONS.complete("T-1").method, "POST")
+  assert.ok(MUTATIONS.complete("T-1").path.endsWith("/T-1/complete"))
+  assert.equal(MUTATIONS.rename("T-1").method, "PATCH")
+  assert.equal(MUTATIONS.create().path, "/v2/task")
+  assert.ok(!MUTATIONS.complete("T /?#").path.includes(" "), "идентификатор кодируется")
+})
+
+test("parseTask разбирает отклик мутации той же нормализацией, что и опрос", () => {
+  const one = JSON.stringify({ ...task({ checked: 1 }), note: '[{"insert":"текст"}]',
+                               recurrence: null, recurrenceGeneratorId: "" })
+  const t = parseTask(one, now)
+  assert.equal(t.id, "T-1")
+  assert.equal(t.checked, 1)
+  assert.equal(isCurrent(t, now), false, "завершённая выпадает из окна существующим предикатом")
+  assert.throws(() => parseTask("{}", now), /no task/)
+  assert.throws(() => parseTask("не JSON", now), /not JSON/)
+})
+
+test("parseTasks доносит note и recurrence до нормализованной задачи", () => {
+  // Без этого поля пришли бы из API и молча пропали в normalizeTask: заметка пустая
+  // у всех, защита от гашения серии выключена, тесты зелёные.
+  const [t1] = parseTasks(body([{ ...task(), note: '[{"insert":"есть"}]',
+    recurrence: null, recurrenceGeneratorId: "T-gen" }]), now)
+  assert.equal(parseNote(t1.note).text, "есть")
+  assert.equal(recurrenceState(t1), "recurring")
+
+  const [t2] = parseTasks(body([{ ...task(), note: null,
+    recurrence: null, recurrenceGeneratorId: "" }]), now)
+  assert.equal(t2.note, "")
+  assert.equal(recurrenceState(t2), "none")
+})
+
+test("нормализация не выдаёт «не знаю» за «обычную задачу»", () => {
+  // Ответ без поля повтора вовсе — форма изменилась. Отказ обязан быть громким.
+  const [t] = parseTasks(body([{ id: "T-9", title: "без поля", start: today, checked: 0 }]), now)
+  assert.equal(recurrenceState(t), "unknown",
+    "отсутствие поля должно доезжать до предиката, а не подменяться пустой строкой")
 })

@@ -7,7 +7,8 @@ export const BASE_URL = "https://api.singularity-app.com"
 export const MAX_COUNT = 1000
 // Sparse field list. `removed` is not an allowed field, deletion shows as `deleteDate`.
 export const TASK_FIELDS = ["id", "title", "projectId", "start", "deadline", "priority",
-  "checked", "deferred", "deleteDate", "modificatedDate"]
+  "checked", "deferred", "deleteDate", "modificatedDate", "note", "recurrence",
+  "recurrenceGeneratorId"]
 // Overlap for modifiedSince: client and server clocks drift, merge is idempotent by id.
 export const INCREMENTAL_OVERLAP_MS = 60_000
 
@@ -89,6 +90,17 @@ function normalizeTask(t, now) {
     deleteDate: t.deleteDate || null,
     removed: t.removed === true,
     modifiedAt: t.modificatedDate || null,
+    // Both fields are carried explicitly, and both must be. normalizeTask builds a fresh
+    // object from named keys and drops everything else, so adding a field to TASK_FIELDS
+    // alone fetches it and then throws it away — an empty note on every task, and a
+    // recurrence guard that never fires, with every test still green.
+    //
+    // `recurrenceGeneratorId` keeps `undefined` when absent rather than collapsing to a
+    // default: recurrenceState reads the field's *presence* to tell "not recurring" from
+    // "the shape we were told about is gone", and a default would erase that difference.
+    note: typeof t.note === "string" ? t.note : "",
+    recurrence: "recurrence" in t ? (t.recurrence || null) : undefined,
+    recurrenceGeneratorId: t.recurrenceGeneratorId,
     overdue: isOverdue({ start }, now)
   }
 }
@@ -550,8 +562,11 @@ export function taskFields(task, now) {
 // we were told about is gone, and the caller must decline rather than assume "ordinary".
 export function recurrenceState(task) {
   if (!task) return "unknown"
-  const hasRule = "recurrence" in task
-  const hasLink = "recurrenceGeneratorId" in task
+  // `in` is the wrong test here: normalizeTask writes both keys unconditionally, so an
+  // absent field arrives as a present key holding `undefined`. Absence is the value, not
+  // the key — the same distinction this function exists to preserve.
+  const hasRule = task.recurrence !== undefined
+  const hasLink = task.recurrenceGeneratorId !== undefined
   if (!hasRule && !hasLink) return "unknown"
   if (task.recurrence && typeof task.recurrence === "object") return "recurring"
   if (typeof task.recurrenceGeneratorId === "string" && task.recurrenceGeneratorId !== "")
@@ -567,4 +582,75 @@ export function taskWebUrl(task) {
   if (task.projectId)
     return { url: WEB_BASE + "/#/project/" + encodeURIComponent(String(task.projectId)), kind: "project" }
   return { url: WEB_BASE, kind: "app" }
+}
+
+// --- Write surface (SNG-3.1) ---
+
+const pad2 = (n) => String(n).padStart(2, "0")
+
+// Every mutation the popup can issue. The verb and path live here so QML names an
+// operation, never a URL and never an HTTP method.
+export const MUTATIONS = {
+  complete: (id) => ({ method: "POST", path: "/v2/task/" + encodeURIComponent(id) + "/complete" }),
+  rename: (id) => ({ method: "PATCH", path: "/v2/task/" + encodeURIComponent(id) }),
+  create: () => ({ method: "POST", path: "/v2/task" })
+}
+
+// curl reads its whole request from a config on stdin, so nothing — not the token, not
+// the title the user typed — reaches `argv`, where `/proc/<pid>/cmdline` would expose it
+// to every process on the machine.
+//
+// A config value is double-quoted, so the value must escape `\` and `"`; an unescaped
+// quote ends the value and the rest of the line becomes curl options on the same channel
+// that carries the token. `applySettings` already rejects a token containing `["\r\n]`
+// for exactly this reason — but a task title is user content, so it gets escaped rather
+// than rejected. Raw CR/LF cannot survive `JSON.stringify`, which encodes them as the
+// two-character `\n`; the guard below is a tripwire for a caller that hand-built a body.
+export function escapeCurlConfigValue(value) {
+  const s = String(value)
+  if (/[\r\n]/.test(s)) throw new Error("curl config value must not contain CR or LF")
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+}
+
+export function buildCurlConfig(token, method, body) {
+  const lines = ['header = "Authorization: Bearer ' + escapeCurlConfigValue(token) + '"']
+  if (method && method !== "GET") lines.push('request = "' + escapeCurlConfigValue(method) + '"')
+  if (body !== undefined && body !== null) {
+    lines.push('header = "Content-Type: application/json"')
+    lines.push('data = "' + escapeCurlConfigValue(JSON.stringify(body)) + '"')
+  }
+  return lines.join("\n") + "\n"
+}
+
+// The command carries only flags and the URL. Kept pure so the "no secret in argv"
+// property is pinned by a test instead of by one look at a process that lives 550 ms.
+export function buildRequestCommand(url) {
+  return ["curl", "-fsS", "--max-time", "15", "-K", "-", url]
+}
+
+// A task created from the popup lands in Входящие — which in SingularityApp is the
+// absence of a project, not a project of that name (verified: none of the 33 projects
+// carries it). Sending no `projectId` is therefore the whole of it.
+export function buildCreateBody(title, now) {
+  const clean = String(title == null ? "" : title).trim()
+  if (clean === "") return null
+  // Morning of the local day, written the way endOfDay writes its own timestamp: the API
+  // normalises the offset to UTC, so the offset must be the local one, not a hardcoded Z.
+  const d = startOfDay(now)
+  const stamp = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T09:00:00${localOffset(d)}`
+  return { title: clean, start: stamp }
+}
+
+export function buildRenameBody(title) {
+  const clean = String(title == null ? "" : title).trim()
+  if (clean === "") return null
+  return { title: clean }
+}
+
+// A mutation answers with the task itself, so the response goes through the same
+// normalisation as a poll — but `parseTasks` wants an array. One task, one entry point.
+export function parseTask(text, now) {
+  const data = parseJson(text)
+  if (!data || typeof data !== "object" || !data.id) throw new Error("response has no task")
+  return normalizeTask(data, now)
 }
