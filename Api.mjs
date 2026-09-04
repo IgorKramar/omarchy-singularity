@@ -489,3 +489,82 @@ export function footerState(filterApplied, excludedCount, hiddenTaskCount, proje
     return { kind: "hidden", hiddenTaskCount, unmatched: unmatchedExcluded(projects, excluded) }
   return { kind: "none", hiddenTaskCount: 0, unmatched: [] }
 }
+
+// --- Task detail (SNG-3.1) ---
+
+export const WEB_BASE = "https://web.singularity-app.com"
+
+// The note arrives as a string holding an array of insert operations. Three outcomes,
+// deliberately distinct: nothing to read, read it, and could-not-read. Returning empty
+// text for the third would make an unreadable note look exactly like a task that has
+// none — a confident wrong answer instead of a visible failure.
+export function parseNote(value) {
+  if (typeof value !== "string" || value.trim() === "") return { text: "", state: "empty" }
+  // The field is a union of two shapes, established by running this over all 192 tasks
+  // in the account: 131 arrive as the marked-up array, 17 as plain text. Plain text is a
+  // perfectly readable note, not a parse failure — labelling it "unparsed" would put a
+  // could-not-read mark on notes that read fine. Only a value that *looks* like the
+  // marked-up shape and then fails is genuinely unreadable.
+  const trimmed = value.trim()
+  if (trimmed[0] !== "[" && trimmed[0] !== "{") return { text: value, state: "ok" }
+  let ops
+  try {
+    ops = JSON.parse(value)
+  } catch (e) {
+    return { text: value, state: "unparsed" }
+  }
+  if (!Array.isArray(ops)) return { text: value, state: "unparsed" }
+  const text = ops.map((o) => (o && typeof o.insert === "string" ? o.insert : "")).join("")
+  // Parsed fine and yields no text — an empty note, not an unreadable one. Marking it
+  // unreadable would warn about a note the user simply never filled in. A note holding
+  // only non-text operations lands here too: this surface renders text, and showing
+  // pictures or formatting is out of scope by decision, so there is nothing to display.
+  if (text.trim() === "") return { text: "", state: "empty" }
+  return { text, state: "ok" }
+}
+
+const PRIORITY_NAMES = { 0: "высокий", 2: "низкий" }
+
+// Only fields that carry a value. 29 of the API's 39 are empty on every task in this
+// account, so rendering them all would be a screen of blank rows. The project is the
+// section header already and is not repeated here.
+export function taskFields(task, now) {
+  if (!task) return []
+  const out = []
+  const day = (v) => new Date(v).toLocaleDateString("ru-RU", { day: "numeric", month: "long" })
+  if (task.start) out.push({ label: "начало", value: day(task.start) })
+  if (task.deadline) out.push({ label: "дедлайн", value: day(task.deadline) })
+  const p = PRIORITY_NAMES[task.priority]
+  if (p) out.push({ label: "приоритет", value: p })
+  if (recurrenceState(task) === "recurring") out.push({ label: "повтор", value: "да" })
+  return out
+}
+
+// A recurring task is two objects, not one — established against live data, not guessed.
+// The generator carries `recurrence` as an object with an empty `recurrenceGeneratorId`;
+// each generated instance carries the reverse. Only the instance lands in the day's
+// window, so a predicate that checked `recurrence` alone would pass every task the user
+// can actually click — failing silently, in the dangerous direction.
+//
+// "unknown" is not a shrug: when neither field is present in the parsed task the shape
+// we were told about is gone, and the caller must decline rather than assume "ordinary".
+export function recurrenceState(task) {
+  if (!task) return "unknown"
+  const hasRule = "recurrence" in task
+  const hasLink = "recurrenceGeneratorId" in task
+  if (!hasRule && !hasLink) return "unknown"
+  if (task.recurrence && typeof task.recurrence === "object") return "recurring"
+  if (typeof task.recurrenceGeneratorId === "string" && task.recurrenceGeneratorId !== "")
+    return "recurring"
+  return "none"
+}
+
+// The web app routes by hash. A per-task route was not established, so the honest
+// fallback is the task's project — and the caller is told which it got, because "opened
+// the project" and "opened the task" must not be indistinguishable to a verifier.
+export function taskWebUrl(task) {
+  if (!task) return { url: WEB_BASE, kind: "app" }
+  if (task.projectId)
+    return { url: WEB_BASE + "/#/project/" + encodeURIComponent(String(task.projectId)), kind: "project" }
+  return { url: WEB_BASE, kind: "app" }
+}

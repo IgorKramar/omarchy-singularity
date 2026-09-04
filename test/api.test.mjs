@@ -9,7 +9,8 @@ import {
   sliceByTab, groupByProject, hiddenGroups, isCollapsed, flattenGroups,
   moveCursor, cursorIndexForId, popupView,
   errorClass, unmatchedExcluded, emptyReason,
-  toggleKey, isStale, priorityLabel, footerState
+  toggleKey, isStale, priorityLabel, footerState,
+  parseNote, taskFields, recurrenceState, taskWebUrl, WEB_BASE
 } from "../Api.mjs"
 
 // Фиксированный «сейчас»: 3 сентября 2026, полдень, локальная зона машины.
@@ -651,4 +652,94 @@ test("cursorIndexForId сохраняет прежнее поведение та
   assert.equal(cursorIndexForId(alive, "task:B", 2, "P-1"), 2, "откат вперёд внутри секции")
   assert.equal(cursorIndexForId(alive, "task:B", 3, "P-1"), 2, "откат назад внутри секции")
   assert.equal(cursorIndexForId(alive, "task:A", 1, "P-1"), 1)
+})
+
+// ---- U2: подробности задачи ----------------------------------------------
+
+test("parseNote различает три исхода, а не два", () => {
+  // Перевод строки внутри значения приходит экранированным — так его шлёт API.
+  assert.deepEqual(parseNote('[{"insert":"Оцинкованные, 4×40.\\n"}]'),
+    { text: "Оцинкованные, 4×40.\n", state: "ok" })
+  assert.deepEqual(parseNote('[{"insert":"строка один\\n"},{"insert":"строка два"}]'),
+    { text: "строка один\nстрока два", state: "ok" })
+  assert.deepEqual(parseNote(""), { text: "", state: "empty" })
+  assert.deepEqual(parseNote("   "), { text: "", state: "empty" })
+  assert.deepEqual(parseNote(undefined), { text: "", state: "empty" })
+  assert.deepEqual(parseNote(null), { text: "", state: "empty" })
+})
+
+test("parseNote: непустая неразбираемая заметка возвращает исходный текст с признаком", () => {
+  // Пустой текст здесь был бы уверенным неверным ответом: пользователь решил бы,
+  // что заметки нет, тогда как её просто не прочитали.
+  // Простой текст — не отказ разбора: так приходят 17 заметок из 192 в живом аккаунте.
+  const plain = "Создать 30-Resources/dacha.md. Контекст: апрель–сентябрь на даче."
+  assert.deepEqual(parseNote(plain), { text: plain, state: "ok" })
+  // А вот это выглядит размеченным и не разбирается — тут пометка уместна.
+  const broken = '[{"insert": "обрыв'
+  assert.deepEqual(parseNote(broken), { text: broken, state: "unparsed" })
+  assert.deepEqual(parseNote('{"insert":"объект вместо массива"}'),
+    { text: '{"insert":"объект вместо массива"}', state: "unparsed" })
+  // Заметка из одной картинки разбирается верно, но текста не даёт. Показ картинок
+  // и разметки план исключает, поэтому для текстовой поверхности она пуста.
+  assert.equal(parseNote('[{"image":"нет текстовых вставок"}]').state, "empty")
+})
+
+test("recurrenceState ловит и генератор, и порождённую задачу", () => {
+  // Форма снята с живой задачи 04.09, а не угадана: у генератора recurrence —
+  // объект при пустом recurrenceGeneratorId, у экземпляра ровно наоборот.
+  const generator = { recurrence: { repeat: { everyday: { interval: 1 } } }, recurrenceGeneratorId: "" }
+  const instance = { recurrence: null, recurrenceGeneratorId: "T-0d647151-dc56-4b3c-89ec-420263827572" }
+  const plain = { recurrence: null, recurrenceGeneratorId: "" }
+  assert.equal(recurrenceState(generator), "recurring")
+  assert.equal(recurrenceState(instance), "recurring",
+    "в окне дня видна именно порождённая задача — предикат по одному recurrence пропустил бы её")
+  assert.equal(recurrenceState(plain), "none")
+})
+
+test("recurrenceState: отсутствие полей даёт «не знаю», а не «обычная»", () => {
+  // Если форма поля изменится и оно перестанет доезжать, отказ обязан быть громким:
+  // «обычная задача» здесь означало бы отправку complete и гашение серии.
+  assert.equal(recurrenceState({ id: "T-1", title: "без полей повтора" }), "unknown")
+  assert.equal(recurrenceState(null), "unknown")
+  assert.equal(recurrenceState({ recurrence: null }), "none", "поле есть и пусто — это ответ")
+})
+
+test("taskFields показывает только заполненное и в постоянном порядке", () => {
+  const full = { start: iso(2026, 8, 3), deadline: iso(2026, 8, 5), priority: 0,
+                 recurrence: null, recurrenceGeneratorId: "" }
+  assert.deepEqual(full.deadline && taskFields(full, now).map((f) => f.label),
+    ["начало", "дедлайн", "приоритет"])
+  const bare = { start: iso(2026, 8, 3), deadline: null, priority: 1,
+                 recurrence: null, recurrenceGeneratorId: "" }
+  assert.deepEqual(taskFields(bare, now).map((f) => f.label), ["начало"],
+    "ни дедлайна, ни обычного приоритета в списке быть не должно")
+  assert.deepEqual(taskFields(null, now), [])
+})
+
+test("taskFields называет повтор отдельной строкой", () => {
+  const rec = { start: iso(2026, 8, 3), deadline: null, priority: 1,
+                recurrence: null, recurrenceGeneratorId: "T-gen" }
+  assert.deepEqual(rec && taskFields(rec, now).map((f) => f.label), ["начало", "повтор"])
+})
+
+test("taskWebUrl различает исходы и кодирует идентификатор", () => {
+  const withProject = taskWebUrl({ id: "T-1", projectId: "P-1341d38e" })
+  assert.equal(withProject.kind, "project")
+  assert.ok(withProject.url.startsWith(WEB_BASE + "/#/project/"))
+  assert.ok(withProject.url.startsWith("https://"), "наружу уходит только https")
+
+  const noProject = taskWebUrl({ id: "T-2", projectId: null })
+  assert.equal(noProject.kind, "app", "исход отличим: это не адрес задачи")
+  assert.equal(taskWebUrl(null).url, WEB_BASE)
+
+  const odd = taskWebUrl({ id: "T-3", projectId: "P /?#&" })
+  assert.ok(!odd.url.includes(" "), "идентификатор процент-кодирован")
+  assert.ok(!odd.url.slice(WEB_BASE.length + 1).includes("#/project/P /"), "пробел не доехал сырым")
+})
+
+test("parseNote: разобранная пустышка — это пустая заметка, а не испорченная", () => {
+  // Живой случай: заметка из одного перевода строки. Разбирается верно и пуста;
+  // пометка «не удалось прочитать» здесь была бы ложной тревогой.
+  assert.deepEqual(parseNote('[{"insert":"\\n"}]'), { text: "", state: "empty" })
+  assert.deepEqual(parseNote('[{"insert":"   "}]'), { text: "", state: "empty" })
 })
