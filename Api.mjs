@@ -260,8 +260,15 @@ function buildGroups(tasks, projects, hidden) {
 // cache; a quiet poll hands the same objects back and must not read as a change.
 function sameGroups(a, b) {
   if (!Array.isArray(a) || a.length !== b.length) return false
-  return a.every((g, i) => g.key === b[i].key && g.hidden === b[i].hidden
-    && g.count === b[i].count && g.tasks.every((t, j) => t === b[i].tasks[j]))
+  // `title` belongs in here: it is what the header draws, and a project renamed in the web
+  // app changes nothing else — same key, same tasks, same count. Without it the gate says
+  // "nothing moved" and the popup keeps the old name until some unrelated edit shakes it
+  // loose. The task-array length is compared outright rather than left to the `count`
+  // invariant, so the two cannot drift apart later.
+  return a.every((g, i) => g.key === b[i].key && g.title === b[i].title
+    && g.hidden === b[i].hidden && g.count === b[i].count
+    && g.tasks.length === b[i].tasks.length
+    && g.tasks.every((t, j) => t === b[i].tasks[j]))
 }
 
 // `prev` is the previously published grouping; the result reuses it when nothing changed.
@@ -273,18 +280,32 @@ export function groupByProject(prev, tasks, projects) {
 // What the SNG-2 project filter dropped, as sections of its own. Derived from the set
 // difference rather than from the exclusion setting, so the count is tasks — which is what
 // R13 promises — and not names in shell.json.
-export function hiddenGroups(prev, allTasks, tasks, projects) {
+export function hiddenGroups(prev, allTasks, tasks, projects, tab, now) {
   const visible = new Set(tasks.map((t) => t.id))
   const dropped = allTasks.filter((t) => !visible.has(t.id))
-  const groups = dropped.length === 0 ? [] : buildGroups(dropped, projects, true)
+  // Two different windows on purpose: the footer's number counts the whole window, because
+  // that is what R13 promises, while the sections themselves follow the active tab like
+  // every other section does (R6). Slicing only the grouping input keeps both true.
+  const forTab = sliceByTab(dropped, tab, now)
+  const groups = forTab.length === 0 ? [] : buildGroups(forTab, projects, true)
   const stable = sameGroups(prev, groups) ? prev : groups
   return { groups: stable, taskCount: dropped.length }
 }
 
 // A hidden section defaults to collapsed and a plain one to expanded, so the set the panel
 // keeps holds only what the user actually toggled — one set, two defaults (R11, R12).
+//
+// The stored key carries the default it was written against. A bare project key read with
+// two opposite polarities silently inverts the section when the project crosses into or out
+// of the filter: expand the grey "Дни рождения", drop it from the exclusion list, and the
+// same stored key now reads as "collapsed". Prefixing pins the entry to the default it was
+// a departure from, so a section whose `hidden` flips falls back to its own default.
+export function toggleKey(group) {
+  return (group.hidden ? "h:" : "p:") + group.key
+}
+
 export function isCollapsed(group, toggled) {
-  const has = (Array.isArray(toggled) ? toggled : []).includes(group.key)
+  const has = (Array.isArray(toggled) ? toggled : []).includes(toggleKey(group))
   return group.hidden ? !has : has
 }
 
@@ -344,7 +365,7 @@ export function popupView(prev, args) {
   const previous = prev || {}
   const sliced = sliceByTab(tasks, tab, now)
   const groups = groupByProject(previous.groups, sliced, projects)
-  const dropped = hiddenGroups(previous.hidden, allTasks, tasks, projects)
+  const dropped = hiddenGroups(previous.hidden, allTasks, tasks, projects, tab, now)
   let sections = groups
   if (dropped.groups.length > 0) {
     const merged = [...groups, ...dropped.groups].sort(compareGroups)
@@ -410,4 +431,47 @@ export function emptyReason(status, windowCount, hiddenTaskCount, tabCount) {
   if (windowCount === 0) return "all-clear"
   if (hiddenTaskCount >= windowCount) return "all-hidden"
   return "tab-empty"
+}
+
+// --- Decisions moved out of QML (SNG-3 review) ---
+//
+// Each of these lived in a QML property binding, where the test runner cannot reach it —
+// the boundary AGENTS.md draws. None of them is complicated; all three are the shape whose
+// error is silent, which is exactly the criterion.
+
+export const FRESHNESS_MS = 60 * 1000
+
+// Below the threshold the cache is fresh enough to show as-is; above it, opening the popup
+// is a reason to poll. An absent or unparseable timestamp counts as stale: nothing has come
+// back yet, or what came back cannot be trusted to say when.
+export function isStale(lastSync, now, thresholdMs = FRESHNESS_MS) {
+  const last = lastSync ? new Date(lastSync).getTime() : 0
+  if (!Number.isFinite(last)) return true
+  return now.getTime() - last >= thresholdMs
+}
+
+// 0 = HIGH, 1 = NORMAL, 2 = LOW — the API's own scale, and it runs the opposite way round
+// from the guess, which is why it is pinned by a test rather than by a reader's memory.
+// Only the two ends are marked; normal is the silent default.
+export function priorityLabel(priority) {
+  return priority === 0 ? "выс" : priority === 2 ? "низ" : ""
+}
+
+export function isHighPriority(priority) {
+  return priority === 0
+}
+
+// Which of the two mutually exclusive filter lines the footer carries. They must never
+// appear together: "the filter has not been applied" and "N tasks are hidden by it" are
+// contradictory claims about the same moment.
+//
+// `unmatched` is only meaningful once the projects cache has arrived. While it is empty
+// every configured name is trivially unmatched, so naming them there tells the user their
+// settings are wrong when they are not — and does it in the same breath as saying the
+// filter has not run yet.
+export function footerState(filterApplied, excludedCount, hiddenTaskCount, projects, excluded) {
+  if (!filterApplied) return { kind: "not-applied", hiddenTaskCount: 0, unmatched: [] }
+  if (excludedCount > 0)
+    return { kind: "hidden", hiddenTaskCount, unmatched: unmatchedExcluded(projects, excluded) }
+  return { kind: "none", hiddenTaskCount: 0, unmatched: [] }
 }

@@ -21,10 +21,9 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  // Below this, the cache is fresh enough to show as-is. Above it, opening the popup is a
-  // reason to poll: the background interval is ten minutes, and a list that stale answers
-  // "what do I have today" with yesterday's answer.
-  readonly property int freshnessMs: 60 * 1000
+  // The threshold itself and the comparison both live in Api.mjs: an unparseable timestamp
+  // has to count as stale, and that is a decision whose error is silent.
+  readonly property int freshnessMs: Api.FRESHNESS_MS
 
   readonly property string svcStatus: svc ? svc.status : "loading"
   readonly property bool updating: svc ? svc.inFlight === true : false
@@ -88,19 +87,24 @@ Panel {
   readonly property string emptyText: {
     if (root.emptyReason === "no-token")
       return "Нет токена. Положите его в " + (root.svc ? root.svc.settingsPath : "settings.json")
-    if (root.emptyReason === "error") {
-      var cls = Api.errorClass(root.svc ? root.svc.errorText : "")
-      if (cls === "auth") return "Токен не принят. Проверьте его в настройках SingularityApp"
-      if (cls === "network") return "Сервис не отвечает. Похоже на сеть"
-      if (cls === "response") return "Ответ пришёл в неожиданном виде"
-      return "Запрос не прошёл"
-    }
+    if (root.emptyReason === "error") return root.errorPhrase
     if (root.emptyReason === "loading") return "Загрузка"
     if (root.emptyReason === "all-clear") return "Всё чисто"
     if (root.emptyReason === "all-hidden")
       return "Всё, что есть в окне, скрыто отсевом: задач " + root.view.hiddenTaskCount
     if (root.emptyReason === "tab-empty") return "На этой вкладке пусто"
     return ""
+  }
+
+  // One phrase, two surfaces: the empty state uses it when there is nothing to show, the
+  // footer when a failed poll sits on top of a list that is still worth reading. Written
+  // once so the two cannot drift into saying different things about the same failure.
+  readonly property string errorPhrase: {
+    var cls = Api.errorClass(root.svc ? root.svc.errorText : "")
+    if (cls === "auth") return "Токен не принят. Проверьте его в настройках SingularityApp"
+    if (cls === "network") return "Сервис не отвечает. Похоже на сеть"
+    if (cls === "response") return "Ответ пришёл в неожиданном виде"
+    return "Запрос не прошёл"
   }
 
   readonly property var unmatched: Api.unmatchedExcluded(
@@ -110,15 +114,24 @@ Panel {
     var parts = []
     // Both directions have to be visible: without the first line an unfiltered list passes
     // for a filtered one, without the second a day emptied by the filter looks like a day
-    // that was genuinely empty.
-    if (root.svc && !root.svc.filterApplied) {
-      var miss = root.unmatched.length > 0 ? " (не найдены: " + root.unmatched.join(", ") + ")" : ""
-      parts.push("Отсев не применён: список проектов ещё не загружен" + miss)
-    } else if (root.svc && root.svc.excludedCount > 0) {
-      parts.push("Скрыто задач: " + root.view.hiddenTaskCount)
-      if (root.unmatched.length > 0)
-        parts.push("в отсеве нет таких проектов: " + root.unmatched.join(", "))
+    // that was genuinely empty. Which of the two applies is decided in Api.mjs — they are
+    // contradictory claims about the same moment, and choosing between them wrongly is the
+    // kind of mistake that reads as a perfectly sensible sentence.
+    var f = Api.footerState(root.svc ? root.svc.filterApplied : true,
+                            root.svc ? root.svc.excludedCount : 0,
+                            root.view.hiddenTaskCount,
+                            root.svc ? root.svc.projects : [],
+                            root.svc ? root.svc.excludedProjects : [])
+    if (f.kind === "not-applied") parts.push("Отсев не применён: список проектов ещё не загружен")
+    else if (f.kind === "hidden") {
+      parts.push("Скрыто задач: " + f.hiddenTaskCount)
+      if (f.unmatched.length > 0)
+        parts.push("в отсеве нет таких проектов: " + f.unmatched.join(", "))
     }
+    // Named whether or not the list is empty. A failed poll on top of a cache that still
+    // has rows is the likeliest failure there is, and without this line the popup shows the
+    // stale list beside the time of the last *successful* sync — a screen that looks right.
+    if (root.svcStatus === "error") parts.push(root.errorPhrase)
     if (root.updating) parts.push("обновляется")
     else if (root.svc && root.svc.lastSync)
       parts.push("обновлено в " + Qt.formatTime(new Date(root.svc.lastSync), "HH:mm"))
@@ -172,7 +185,7 @@ Panel {
   // acting on one waits for SNG-3.1.
   function activateCursor() {
     var row = root.cursorRow
-    if (row && row.kind === "header") root.toggleSection(row.key)
+    if (row && row.kind === "header") root.toggleSection(row.group)
   }
 
   function selectByHover(id) {
@@ -208,7 +221,10 @@ Panel {
     referenceItem: listColumn
   }
 
-  function toggleSection(key) {
+  // Takes the group, not a bare key: the stored entry has to carry the default it was
+  // written against, or a project crossing into or out of the filter inverts its section.
+  function toggleSection(group) {
+    var key = Api.toggleKey(group)
     var next = root.toggledSections.slice()
     var at = next.indexOf(key)
     if (at === -1) next.push(key)
@@ -235,8 +251,8 @@ Panel {
     listFlick.contentY = 0
   }
 
-  // close() и toggle() не переопределяются: базовый Ui/Panel даёт их дословно, а вызов
-  // open() внутри базового toggle() разрешается на переопределение ниже — проверено.
+  // close() and toggle() are not overridden: the base Ui/Panel provides both verbatim, and
+  // the open() call inside the base toggle() resolves to the override below — verified.
 
   function stepTab(delta) {
     var at = Api.POPUP_TABS.indexOf(root.tab)
@@ -254,9 +270,7 @@ Panel {
   // exactly the case that must poll.
   function refreshIfStale() {
     if (!svc || typeof svc.refresh !== "function") return
-    var last = svc.lastSync ? new Date(svc.lastSync).getTime() : 0
-    if (Date.now() - last < root.freshnessMs) return
-    svc.refresh()
+    if (Api.isStale(svc.lastSync, new Date(), root.freshnessMs)) svc.refresh()
   }
 
   KeyboardPanel {
@@ -436,7 +450,7 @@ Panel {
                   onPositionChanged: function(mouse) {
                     root.notePointerMoved(headerItem, mouse, "header:" + section.modelData.key)
                   }
-                  onClicked: root.toggleSection(section.modelData.key)
+                  onClicked: root.toggleSection(section.modelData)
                 }
               }
 

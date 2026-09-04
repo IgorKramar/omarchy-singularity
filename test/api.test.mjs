@@ -8,7 +8,8 @@ import {
   computeView, excludedList,
   sliceByTab, groupByProject, hiddenGroups, isCollapsed, flattenGroups,
   moveCursor, cursorIndexForId, popupView,
-  errorClass, unmatchedExcluded, emptyReason
+  errorClass, unmatchedExcluded, emptyReason,
+  toggleKey, isStale, priorityLabel, footerState
 } from "../Api.mjs"
 
 // Фиксированный «сейчас»: 3 сентября 2026, полдень, локальная зона машины.
@@ -358,14 +359,14 @@ test("hiddenGroups: разность окна и отсеянного вида �
     t("A", { projectId: "P-1" }), t("B", { projectId: "P-2" }), t("C", { projectId: "P-2" })
   ]
   const visible = all.filter((x) => x.projectId !== "P-2")
-  const hidden = hiddenGroups(null, all, visible, projectsFixture)
+  const hidden = hiddenGroups(null, all, visible, projectsFixture, "all", now)
   assert.equal(hidden.taskCount, 2, "две задачи, а не одно название в настройке")
   assert.deepEqual(hidden.groups.map((g) => [g.title, g.count, g.hidden]), [["Дача", 2, true]])
 })
 
 test("hiddenGroups: при пустом отсеве секций нет и число скрытых равно нулю", () => {
   const all = [t("A", { projectId: "P-1" })]
-  const hidden = hiddenGroups(null, all, all, projectsFixture)
+  const hidden = hiddenGroups(null, all, all, projectsFixture, "all", now)
   assert.deepEqual(hidden.groups, [])
   assert.equal(hidden.taskCount, 0)
 })
@@ -373,18 +374,18 @@ test("hiddenGroups: при пустом отсеве секций нет и чи
 test("hiddenGroups возвращает прежнюю ссылку на неизменном входе", () => {
   const all = [t("A", { projectId: "P-1" }), t("B", { projectId: "P-2" })]
   const visible = [all[0]]
-  const first = hiddenGroups(null, all, visible, projectsFixture).groups
-  assert.equal(hiddenGroups(first, all, visible, projectsFixture).groups, first)
-  assert.notEqual(hiddenGroups(first, all, all, projectsFixture).groups, first)
+  const first = hiddenGroups(null, all, visible, projectsFixture, "all", now).groups
+  assert.equal(hiddenGroups(first, all, visible, projectsFixture, "all", now).groups, first)
+  assert.notEqual(hiddenGroups(first, all, all, projectsFixture, "all", now).groups, first)
 })
 
 test("isCollapsed: обычная секция по умолчанию развёрнута, скрытая — свёрнута", () => {
   const plain = { key: "P-1", hidden: false }
   const secret = { key: "P-2", hidden: true }
   assert.equal(isCollapsed(plain, []), false)
-  assert.equal(isCollapsed(plain, ["P-1"]), true)
+  assert.equal(isCollapsed(plain, [toggleKey(plain)]), true)
   assert.equal(isCollapsed(secret, []), true)
-  assert.equal(isCollapsed(secret, ["P-2"]), false)
+  assert.equal(isCollapsed(secret, [toggleKey(secret)]), false)
 })
 
 test("flattenGroups: заголовки и строки в порядке отрисовки; свёрнутая секция даёт только заголовок", () => {
@@ -393,7 +394,8 @@ test("flattenGroups: заголовки и строки в порядке отр
   ], projectsFixture)
   assert.deepEqual(flattenGroups(null, groups, []).map((r) => r.kind),
     ["header", "task", "task", "header", "task"])
-  const collapsed = flattenGroups(null, groups, ["P-2"])
+  // Секции идут по алфавиту: groups[0] — «Дача» с двумя задачами.
+  const collapsed = flattenGroups(null, groups, [toggleKey(groups[0])])
   assert.deepEqual(collapsed.map((r) => r.kind), ["header", "header", "task"])
 })
 
@@ -401,7 +403,7 @@ test("flattenGroups возвращает прежнюю ссылку на неи
   const groups = groupByProject(null, [t("A", { projectId: "P-1" })], projectsFixture)
   const first = flattenGroups(null, groups, [])
   assert.equal(flattenGroups(first, groups, []), first)
-  assert.notEqual(flattenGroups(first, groups, ["P-1"]), first)
+  assert.notEqual(flattenGroups(first, groups, [toggleKey(groups[0])]), first)
 })
 
 test("moveCursor заворачивается по кругу на обоих концах", () => {
@@ -508,4 +510,100 @@ test("emptyReason: пять видов пустоты не подменяют д
 test("emptyReason: пришедший кэш важнее состояния загрузки", () => {
   assert.equal(emptyReason("loading", 3, 3, 0), "all-hidden")
   assert.equal(emptyReason("loading", 3, 0, 0), "tab-empty")
+})
+
+// ---- Находки ревью SNG-3 -------------------------------------------------
+
+test("groupByProject замечает переименование проекта при неизменном наборе задач", () => {
+  // Тот самый пробел, через который дефект прошёл 56 зелёных тестов: набор задач тот же,
+  // счётчик тот же, ключ тот же — меняется только имя, и гейт говорил «ничего не двигалось».
+  const tasks = [t("A", { projectId: "P-2" })]
+  const first = groupByProject(null, tasks, projectsFixture)
+  assert.equal(first[0].title, "Дача")
+  const renamed = [{ id: "P-1", title: "Работа" }, { id: "P-2", title: "Огород" }]
+  const second = groupByProject(first, tasks, renamed)
+  assert.notEqual(second, first, "переименование обязано перестроить секции")
+  assert.equal(second[0].title, "Огород")
+})
+
+test("hiddenGroups тоже замечает переименование скрытого проекта", () => {
+  const all = [t("A", { projectId: "P-1" }), t("B", { projectId: "P-2" })]
+  const visible = [all[0]]
+  const first = hiddenGroups(null, all, visible, projectsFixture, "all", now).groups
+  const renamed = [{ id: "P-1", title: "Работа" }, { id: "P-2", title: "Огород" }]
+  const second = hiddenGroups(first, all, visible, renamed, "all", now).groups
+  assert.notEqual(second, first)
+  assert.equal(second[0].title, "Огород")
+})
+
+test("toggleKey: запись помнит умолчание, от которого отступили", () => {
+  const plain = { key: "P-1", hidden: false }
+  const secret = { key: "P-1", hidden: true }
+  assert.notEqual(toggleKey(plain), toggleKey(secret),
+    "один ключ на два умолчания переворачивал бы секцию при выходе проекта из отсева")
+})
+
+test("isCollapsed: проект, вышедший из отсева, не переворачивает свою секцию", () => {
+  const secret = { key: "P-2", hidden: true }
+  // Пользователь развернул скрытую секцию: её ключ уходит в набор.
+  const toggled = [toggleKey(secret)]
+  assert.equal(isCollapsed(secret, toggled), false, "развёрнута, как и просили")
+  // Проект убрали из списка исключаемых — секция стала обычной.
+  const plain = { key: "P-2", hidden: false }
+  assert.equal(isCollapsed(plain, toggled), false,
+    "обычная секция по умолчанию развёрнута; прежняя запись не должна её сворачивать")
+})
+
+test("hiddenGroups следует активной вкладке, а число скрытых остаётся по всему окну", () => {
+  const all = [
+    t("A", { projectId: "P-2", start: yesterday }),
+    t("B", { projectId: "P-2", start: today }),
+    t("C", { projectId: "P-1", start: today })
+  ]
+  const visible = [all[2]]
+  const over = hiddenGroups(null, all, visible, projectsFixture, "overdue", now)
+  assert.equal(over.groups[0].count, 1, "на «Просрочено» в секции только просроченная")
+  assert.equal(over.taskCount, 2, "а скрыто по-прежнему две задачи окна (R13)")
+  const todayTab = hiddenGroups(null, all, visible, projectsFixture, "today", now)
+  assert.equal(todayTab.groups[0].count, 1)
+  assert.equal(todayTab.taskCount, 2)
+})
+
+test("isStale: пустая и непарсимая отметка считаются устаревшими", () => {
+  const nowMs = new Date(2026, 8, 4, 12, 0, 0)
+  assert.equal(isStale("", nowMs), true, "ничего ещё не приходило — надо опросить")
+  assert.equal(isStale("не-дата", nowMs), true, "отметке, которую не разобрать, доверять нечему")
+  assert.equal(isStale(new Date(2026, 8, 4, 11, 59, 30).toISOString(), nowMs), false)
+  assert.equal(isStale(new Date(2026, 8, 4, 11, 58, 0).toISOString(), nowMs), true)
+  assert.equal(isStale(new Date(2026, 8, 4, 11, 59, 0).toISOString(), nowMs), true, "ровно порог — устарело")
+})
+
+test("priorityLabel закрепляет шкалу API, а не догадку о ней", () => {
+  assert.equal(priorityLabel(0), "выс", "0 — высокий, шкала перевёрнута")
+  assert.equal(priorityLabel(1), "")
+  assert.equal(priorityLabel(2), "низ")
+  assert.equal(priorityLabel(undefined), "")
+})
+
+test("footerState: «отсев не применён» и «скрыто N» не показываются вместе", () => {
+  const notApplied = footerState(false, 2, 7, [], ["дача", "по"])
+  assert.equal(notApplied.kind, "not-applied")
+  assert.deepEqual(notApplied.unmatched, [],
+    "пока кэша проектов нет, не совпало вообще ничто — называть эти имена значит врать")
+  assert.equal(notApplied.hiddenTaskCount, 0)
+
+  const hidden = footerState(true, 1, 3, projectsFixture, ["дача", "нетакого"])
+  assert.equal(hidden.kind, "hidden")
+  assert.equal(hidden.hiddenTaskCount, 3)
+  assert.deepEqual(hidden.unmatched, ["нетакого"])
+
+  assert.equal(footerState(true, 0, 0, projectsFixture, []).kind, "none")
+})
+
+test("emptyReason молчит при ошибке с непустым кэшем — подвал обязан сказать это сам", () => {
+  // Закрепляем разделение обязанностей: сообщение о пустоте отвечает только за пустоту,
+  // а провалившийся опрос поверх живого списка показывает подвал.
+  assert.equal(emptyReason("error", 3, 0, 2), "",
+    "список есть — место сообщению об ошибке в подвале, а не поверх списка")
+  assert.equal(emptyReason("error", 0, 0, 0), "error")
 })

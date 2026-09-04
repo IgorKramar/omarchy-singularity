@@ -1,6 +1,7 @@
 import QtQuick
 import qs.Commons
 import qs.Ui
+import "Api.mjs" as Api
 
 // One task in the popup list: title, and the marks that change what you do about it —
 // overdue, deadline, priority.
@@ -20,12 +21,13 @@ Item {
 
   readonly property color dim: Qt.darker(foreground, 1.6)
 
-  // 0 = HIGH, 1 = NORMAL, 2 = LOW — the API's own scale, and it runs the opposite way
-  // round from the guess. Only the two ends are marked; normal is the silent default.
-  readonly property string priorityLabel: task && task.priority === 0 ? "выс"
-    : task && task.priority === 2 ? "низ" : ""
+  // The scale itself lives in Api.mjs, where a test pins it: the API runs 0 = HIGH,
+  // 1 = NORMAL, 2 = LOW — the opposite way round from the guess, and getting it backwards
+  // would paint the calmest task red without anything failing.
+  readonly property string priorityLabel: task ? Api.priorityLabel(task.priority) : ""
   // Named in text as well as coloured, so the mark still reads without colour vision (R9).
-  readonly property color priorityColor: task && task.priority === 0 ? Color.urgent : root.dim
+  readonly property color priorityColor: task && Api.isHighPriority(task.priority)
+    ? Color.urgent : root.dim
 
   readonly property string deadlineLabel: {
     if (!task || !task.deadline) return ""
@@ -104,10 +106,10 @@ Item {
     }
   }
 
-  // hoverEnabled, хотя наведение само по себе ничего не красит: без него
-  // onPositionChanged срабатывает только при зажатой кнопке, а курсор ведётся
-  // именно движением указателя. Клик остаётся проглоченным намеренно — иначе он
-  // дошёл бы до слоя закрытия и захлопнул попап.
+  // hoverEnabled even though hovering paints nothing on its own: without it
+  // onPositionChanged fires only while a button is held, and the cursor follows pointer
+  // movement. The click stays swallowed on purpose — letting it through would reach the
+  // dismiss layer and close the popup.
   MouseArea {
     anchors.fill: parent
     hoverEnabled: true
