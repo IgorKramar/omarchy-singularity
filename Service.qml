@@ -65,6 +65,10 @@ Item {
 
     if (token === root.apiToken) return
     root.apiToken = token
+    // Writes belong to the credential that issued them. A queue, a row still drawn as
+    // "sent", and a stale write error all outlive the token that produced them otherwise —
+    // and a 401 left in the footer after the token is fixed reports a failure that is over.
+    root.abandonMutations()
     if (token === "") {
       root.status = "no-token"
       root.errorText = ""
@@ -421,7 +425,13 @@ Item {
         excludedProjects: Api.excludedList(root.excludedProjects),
         filterApplied: root.filterApplied,
         lastSync: root.lastSync,
-        inFlight: root.inFlight
+        inFlight: root.inFlight,
+        // The write side, published for the same reason as `inFlight`: a mutation lives
+        // about half a second, and a screenshot race is not a verification method.
+        mutatingId: root.mutatingId,
+        pendingIds: root.pendingIds,
+        mutationQueued: root.mutationQueue.length,
+        mutationError: root.mutationError
       })
     }
 

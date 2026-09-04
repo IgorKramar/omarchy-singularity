@@ -107,6 +107,33 @@ Panel {
     return "Запрос не прошёл"
   }
 
+  // Four states, decided here so the row draws and never judges. "unknown" is not a
+  // shrug: the recurrence field did not arrive, and completing on a guess could
+  // extinguish a repeating series — declining is the only safe answer.
+  function checkStateFor(task) {
+    if (!root.svc) return "unknown"
+    if (root.svc.pendingIds.indexOf(task.id) !== -1) return "pending"
+    var r = Api.recurrenceState(task)
+    return r === "none" ? "none" : r
+  }
+
+  function completeTask(task) {
+    if (!root.svc || !task) return
+    if (Api.recurrenceState(task) !== "none") return
+    root.svc.complete(task.id)
+  }
+
+  // The write path carries its own error text, kept apart from the poll's: one checkbox
+  // that failed to save must not repaint the popup as a broken service.
+  readonly property string mutationPhrase: {
+    if (!root.svc || !root.svc.mutationError) return ""
+    var cls = Api.errorClass(root.svc.mutationError)
+    if (cls === "auth") return "Не сохранено: токен не принят"
+    if (cls === "network") return "Не сохранено: сервис не отвечает"
+    if (cls === "response") return "Не сохранено: ответ в неожиданном виде"
+    return "Не сохранено"
+  }
+
   readonly property var unmatched: Api.unmatchedExcluded(
     root.svc ? root.svc.projects : [], root.svc ? root.svc.excludedProjects : [])
 
@@ -131,6 +158,7 @@ Panel {
     // Named whether or not the list is empty. A failed poll on top of a cache that still
     // has rows is the likeliest failure there is, and without this line the popup shows the
     // stale list beside the time of the last *successful* sync — a screen that looks right.
+    if (root.mutationPhrase !== "") parts.push(root.mutationPhrase)
     if (root.svcStatus === "error") parts.push(root.errorPhrase)
     if (root.updating) parts.push("обновляется")
     else if (root.svc && root.svc.lastSync)
@@ -302,8 +330,12 @@ Panel {
         root.activateCursor()
       }
       onActivateRequested: {
+        // Enter raised returnRequested first and set the flag; Space raises only this one.
+        // The existing flag therefore already separates the two — no new mechanism needed.
         if (root.suppressNextActivate) { root.suppressNextActivate = false; return }
-        root.activateCursor()
+        var row = root.cursorRow
+        if (row && row.kind === "task") root.completeTask(row.task)
+        else root.activateCursor()
       }
 
       // ---- Tabs. Three slices of one cache, so switching costs no request.
@@ -476,6 +508,8 @@ Panel {
                   onHasCursorChanged: {
                     if (hasCursor && root.keyboardDrivingCursor) root.ensureVisible(taskRow)
                   }
+                  checkState: root.checkStateFor(modelData)
+                  onCompleteRequested: root.completeTask(modelData)
                   onPointerMoved: function(mouse) {
                     root.notePointerMoved(taskRow, mouse, "task:" + modelData.id)
                   }
