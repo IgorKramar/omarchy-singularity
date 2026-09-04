@@ -24,6 +24,7 @@ Item {
 
   signal pointerMoved(var mouse)
   signal completeRequested()
+  signal expandRequested()
 
   readonly property color dim: Qt.darker(foreground, 1.6)
 
@@ -163,12 +164,13 @@ Item {
 
   // hoverEnabled even though hovering paints nothing on its own: without it
   // onPositionChanged fires only while a button is held, and the cursor follows pointer
-  // movement. The click stays swallowed on purpose — letting it through would reach the
-  // dismiss layer and close the popup.
+  // movement. The click must still not reach the dismiss layer below, which would close
+  // the popup — so it is consumed here and spent on the expansion instead.
   MouseArea {
     anchors.fill: parent
     hoverEnabled: true
     onPositionChanged: function(mouse) { root.pointerMoved(mouse) }
+    onClicked: root.expandRequested()
   }
 
   // Declared last so it sits above the row-wide handler, which deliberately swallows every

@@ -543,12 +543,15 @@ const PRIORITY_NAMES = { 0: "высокий", 2: "низкий" }
 export function taskFields(task, now) {
   if (!task) return []
   const out = []
-  const day = (v) => new Date(v).toLocaleDateString("ru-RU", { day: "numeric", month: "long" })
-  if (task.start) out.push({ label: "начало", value: day(task.start) })
-  if (task.deadline) out.push({ label: "дедлайн", value: day(task.deadline) })
+  // Dates leave here as their raw value with `kind: "date"`, not as formatted text: the
+  // QML engine's toLocaleDateString ignores the Intl options Node honours, so formatting
+  // here prints "04.09.2026" on screen while the test reads "4 сентября" and passes. The
+  // caller formats through Qt.locale, the way the row already formats its deadline.
+  if (task.start) out.push({ label: "начало", value: task.start, kind: "date" })
+  if (task.deadline) out.push({ label: "дедлайн", value: task.deadline, kind: "date" })
   const p = PRIORITY_NAMES[task.priority]
-  if (p) out.push({ label: "приоритет", value: p })
-  if (recurrenceState(task) === "recurring") out.push({ label: "повтор", value: "да" })
+  if (p) out.push({ label: "приоритет", value: p, kind: "text" })
+  if (recurrenceState(task) === "recurring") out.push({ label: "повтор", value: "да", kind: "text" })
   return out
 }
 

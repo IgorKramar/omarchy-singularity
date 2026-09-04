@@ -842,3 +842,16 @@ test("нормализация не выдаёт «не знаю» за «обы
   assert.equal(recurrenceState(t), "unknown",
     "отсутствие поля должно доезжать до предиката, а не подменяться пустой строкой")
 })
+
+test("taskFields отдаёт дату сырой, а не отформатированной", () => {
+  // Формат даты нельзя проверить здесь: движок QML и node расходятся в toLocaleDateString,
+  // и тест бы зеленел на «4 сентября», пока на экране стоит «04.09.2026». Значит здесь
+  // проверяется ровно то, что сюда относится, — что значение уехало наружу нетронутым.
+  const task = { start: iso(2026, 8, 3), deadline: iso(2026, 8, 5), priority: 0,
+                 recurrence: null, recurrenceGeneratorId: "" }
+  const fields = taskFields(task, now)
+  const start = fields.find((f) => f.label === "начало")
+  assert.equal(start.kind, "date")
+  assert.equal(start.value, task.start, "значение уехало нетронутым")
+  assert.equal(fields.find((f) => f.label === "приоритет").kind, "text")
+})

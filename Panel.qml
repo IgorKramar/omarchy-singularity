@@ -123,6 +123,21 @@ Panel {
     root.svc.complete(task.id)
   }
 
+  // One expansion at a time: the note is the tallest thing the popup draws, and two of them
+  // open at once turn a list you scan into a page you scroll.
+  property string expandedId: ""
+
+  function toggleExpanded(task) {
+    if (!task) return
+    root.expandedId = root.expandedId === task.id ? "" : task.id
+  }
+
+  function openWeb(url) {
+    // execArgv, not a shell string: the URL is built from API data, and the constant
+    // `exec "$@"` keeps it a single argument no matter what it contains.
+    Util.execArgv(["xdg-open", url])
+  }
+
   // The write path carries its own error text, kept apart from the poll's: one checkbox
   // that failed to save must not repaint the popup as a broken service.
   readonly property string mutationPhrase: {
@@ -214,6 +229,7 @@ Panel {
   function activateCursor() {
     var row = root.cursorRow
     if (row && row.kind === "header") root.toggleSection(row.group)
+    else if (row && row.kind === "task") root.toggleExpanded(row.task)
   }
 
   function selectByHover(id) {
@@ -489,29 +505,53 @@ Panel {
               Repeater {
                 model: section.collapsed ? [] : section.modelData.tasks
 
-                TaskRow {
-                  id: taskRow
+                // Row and its expansion are one delegate: the block belongs under the row
+                // that owns it, and a Repeater hands out exactly one item per model entry.
+                Column {
+                  id: rowGroup
                   required property var modelData
                   width: section.width
-                  task: modelData
-                  overdue: Api.isOverdue(modelData, root.view.now)
-                  foreground: root.contentForeground
-                  fontFamily: root.contentFontFamily
-                  // By id, not by object identity: the task object reaches this delegate
-                  // through two nested `var` properties, and QML does not promise the same
-                  // reference comes out the far end. The section header above compares keys
-                  // and highlighted correctly while this row, comparing references, stayed
-                  // dark — the cursor was moving all along.
-                  hasCursor: root.cursorRow && root.cursorRow.kind === "task"
-                    && root.cursorRow.id === "task:" + modelData.id
 
-                  onHasCursorChanged: {
-                    if (hasCursor && root.keyboardDrivingCursor) root.ensureVisible(taskRow)
+                  TaskRow {
+                    id: taskRow
+                    width: rowGroup.width
+                    task: rowGroup.modelData
+                    overdue: Api.isOverdue(rowGroup.modelData, root.view.now)
+                    foreground: root.contentForeground
+                    fontFamily: root.contentFontFamily
+                    // By id, not by object identity: the task object reaches this delegate
+                    // through two nested `var` properties, and QML does not promise the same
+                    // reference comes out the far end. The section header above compares keys
+                    // and highlighted correctly while this row, comparing references, stayed
+                    // dark — the cursor was moving all along.
+                    hasCursor: root.cursorRow && root.cursorRow.kind === "task"
+                      && root.cursorRow.id === "task:" + rowGroup.modelData.id
+
+                    onHasCursorChanged: {
+                      if (hasCursor && root.keyboardDrivingCursor) root.ensureVisible(taskRow)
+                    }
+                    checkState: root.checkStateFor(rowGroup.modelData)
+                    onCompleteRequested: root.completeTask(rowGroup.modelData)
+                    onPointerMoved: function(mouse) {
+                      root.notePointerMoved(taskRow, mouse, "task:" + rowGroup.modelData.id)
+                    }
+                    onExpandRequested: root.toggleExpanded(rowGroup.modelData)
                   }
-                  checkState: root.checkStateFor(modelData)
-                  onCompleteRequested: root.completeTask(modelData)
-                  onPointerMoved: function(mouse) {
-                    root.notePointerMoved(taskRow, mouse, "task:" + modelData.id)
+
+                  // Loaded only while open. The block carries a Repeater and parses the
+                  // note, and the "all" tab can hold hundreds of rows — none of which need
+                  // that work done for an expansion nobody opened.
+                  Loader {
+                    width: rowGroup.width
+                    active: root.expandedId === rowGroup.modelData.id
+                    visible: active
+                    sourceComponent: TaskDetails {
+                      width: rowGroup.width
+                      task: rowGroup.modelData
+                      foreground: root.contentForeground
+                      fontFamily: root.contentFontFamily
+                      onOpenRequested: function(url) { root.openWeb(url) }
+                    }
                   }
                 }
               }
