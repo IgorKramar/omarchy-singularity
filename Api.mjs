@@ -209,8 +209,13 @@ export const POPUP_TABS = ["today", "all", "overdue"]
 
 // Two distinct buckets, never merged: "no project" is a property of the task, "unknown
 // project" is a gap in our projects cache (R10). Collapsing them would hide the gap.
-export const NO_PROJECT = " no-project"
-export const UNKNOWN_PROJECT = " unknown-project"
+//
+// The leading NUL is the collision guarantee, stated rather than left implicit: a project id
+// from the API cannot contain one, so these keys can never be mistaken for a real project.
+// Written as an escape, not as a raw byte — a literal NUL in the source makes grep treat the
+// whole file as binary and print nothing, which reads as "no match" rather than "cannot read".
+export const NO_PROJECT = "\u0000no-project"
+export const UNKNOWN_PROJECT = "\u0000unknown-project"
 
 const GROUP_TITLES = { [NO_PROJECT]: "Без проекта", [UNKNOWN_PROJECT]: "Неизвестный проект" }
 
