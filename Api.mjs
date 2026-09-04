@@ -314,9 +314,14 @@ export function isCollapsed(group, toggled) {
   return group.hidden ? !has : has
 }
 
+// `group` belongs in here, and by reference. A row carries the section object an
+// action later reads `hidden` off; comparing the section *key* would change nothing,
+// because a header row already embeds its key in `id`. Without the object itself in
+// the comparison the gate can hand back a row pointing at a section the rebuild
+// evicted — harmless while Enter only folds, wrong the moment it edits a task.
 function sameFlat(a, b) {
   return Array.isArray(a) && a.length === b.length
-    && a.every((r, i) => r.id === b[i].id && r.task === b[i].task)
+    && a.every((r, i) => r.id === b[i].id && r.task === b[i].task && r.group === b[i].group)
 }
 
 // The sequence the keyboard walks, in drawing order: a header, then its rows unless the
@@ -357,6 +362,10 @@ export function cursorIndexForId(list, id, fallbackIndex, sectionKey) {
     for (let i = from - 1; i >= 0; i--)
       if (items[i].key === sectionKey && items[i].kind === "task") return i
     for (let i = 0; i < items.length; i++) if (items[i].key === sectionKey) return i
+    // Nothing of the anchor's section survived. Clamping to the old index would put
+    // the cursor on another project's row — a header or a task, both equally wrong —
+    // and the next keystroke would act on it. No cursor is the honest answer.
+    return -1
   }
   if (fallbackIndex === undefined || fallbackIndex < 0) return -1
   return Math.max(0, Math.min(items.length - 1, fallbackIndex))

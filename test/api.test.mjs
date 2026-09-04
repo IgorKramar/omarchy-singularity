@@ -441,10 +441,13 @@ test("cursorIndexForId: ушла последняя в секции — курс
   assert.equal(cursorIndexForId(emptied, "task:A", 1, "P-1"), 0)
 })
 
-test("cursorIndexForId: пустой список снимает курсор, исчезнувшая секция — откат на индекс", () => {
+test("cursorIndexForId: пустой список и исчезнувшая секция одинаково снимают курсор", () => {
   assert.equal(cursorIndexForId([], "task:A", 1, "P-1"), -1)
   const noSection = [{ kind: "header", id: "h:P-9", key: "P-9" }, { kind: "task", id: "task:Z", key: "P-9" }]
-  assert.equal(cursorIndexForId(noSection, "task:A", 1, "P-1"), 1)
+  // Переписано в SNG-3.1: прежде здесь ожидался откат на индекс, то есть посадка
+  // курсора на строку чужого проекта. С появлением действий над задачей это стало бы
+  // правкой не той задачи.
+  assert.equal(cursorIndexForId(noSection, "task:A", 1, "P-1"), -1)
   assert.equal(cursorIndexForId(noSection, "task:A", -1, "P-1"), -1)
 })
 
@@ -606,4 +609,46 @@ test("emptyReason молчит при ошибке с непустым кэше�
   assert.equal(emptyReason("error", 3, 0, 2), "",
     "список есть — место сообщению об ошибке в подвале, а не поверх списка")
   assert.equal(emptyReason("error", 0, 0, 0), "error")
+})
+
+// ---- U1: закрытие резидуалов SNG-3 ---------------------------------------
+
+test("flattenGroups замечает подмену объекта секции при тех же ключе и задачах", () => {
+  // Резидуал 4. Строка несёт ссылку на секцию; действие пойдёт по ней.
+  // Ключ у заголовка вшит в идентификатор, поэтому сравнивать надо объект.
+  const tasks = [t("A", { projectId: "P-1" })]
+  const first = groupByProject(null, tasks, projectsFixture)
+  const flatFirst = flattenGroups(null, first, [])
+  // Меняем только название: состав плоского списка тот же, поэтому сравнение
+  // обязано дойти до самого объекта секции. Смена hidden не годится — она меняет
+  // число строк, и тест позеленел бы, не проверив ничего.
+  const moved = [{ ...first[0], title: "Огород" }]
+  const flatMoved = flattenGroups(flatFirst, moved, [])
+  assert.notEqual(flatMoved, flatFirst,
+    "строка не должна нести ссылку на вытесненную секцию")
+  assert.equal(flatMoved[0].group, moved[0])
+})
+
+test("cursorIndexForId снимает курсор, когда от его секции не осталось строк", () => {
+  // Резидуал 5. Клампинг сажал курсор на строку чужого проекта; после мутации
+  // это стало бы правкой не той задачи.
+  const gone = [
+    { kind: "header", id: "h:P-9", key: "P-9" },
+    { kind: "task", id: "task:Z", key: "P-9" }
+  ]
+  assert.equal(cursorIndexForId(gone, "task:A", 1, "P-1"), -1,
+    "ни заголовок, ни задача чужой секции курсору не годятся")
+  assert.equal(cursorIndexForId(gone, "task:A", 0, "P-1"), -1)
+})
+
+test("cursorIndexForId сохраняет прежнее поведение там, где секция уцелела", () => {
+  const alive = [
+    { kind: "header", id: "h:P-1", key: "P-1" },
+    { kind: "task", id: "task:A", key: "P-1" },
+    { kind: "task", id: "task:C", key: "P-1" }
+  ]
+  assert.equal(cursorIndexForId(alive, "task:C", 1, "P-1"), 2, "находит по идентификатору")
+  assert.equal(cursorIndexForId(alive, "task:B", 2, "P-1"), 2, "откат вперёд внутри секции")
+  assert.equal(cursorIndexForId(alive, "task:B", 3, "P-1"), 2, "откат назад внутри секции")
+  assert.equal(cursorIndexForId(alive, "task:A", 1, "P-1"), 1)
 })
