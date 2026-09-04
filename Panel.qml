@@ -1,0 +1,494 @@
+import QtQuick
+import qs.Commons
+import qs.Ui
+import "Api.mjs" as Api
+
+// The popup behind the bar pill: what the pill's number is made of.
+//
+// A nested panel of BarWidget.qml, not a second loadable view of the plugin — the manifest
+// already declares an overlay, and a second entry point would collide with it. The widget
+// owns the Loader and injects `bar`, `settings`, the anchor and itself; everything the bar
+// identifies a panel by has to be that widget rather than this panel (see barIdentity).
+Panel {
+  id: root
+  moduleName: "io.github.igorkramar.singularity"
+
+  property var anchorItem: null
+  property var svc: null
+
+  // The bar tracks the widget mounted in its slot, not this nested panel: switchPanelFrom
+  // matches on slot.activeItem, so handing it this panel makes Tab silently do nothing.
+  property var hostWidget: null
+  readonly property var barIdentity: hostWidget || root
+
+  // Below this, the cache is fresh enough to show as-is. Above it, opening the popup is a
+  // reason to poll: the background interval is ten minutes, and a list that stale answers
+  // "what do I have today" with yesterday's answer.
+  readonly property int freshnessMs: 60 * 1000
+
+  readonly property string svcStatus: svc ? svc.status : "loading"
+  readonly property bool updating: svc ? svc.inFlight === true : false
+
+  // Guarded so the panel renders before the bar is injected — the bar-widget contract
+  // instantiates it bare.
+  readonly property color contentForeground: bar ? bar.foreground : Color.foreground
+  readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property color dim: Qt.darker(contentForeground, 1.6)
+
+  // ---- The view ------------------------------------------------------------
+  //
+  // One property, one assignment. Api.popupView holds the previous section, group and row
+  // references inside the object it returns, so a quiet poll hands back the very same
+  // arrays and the Repeaters below do not rebuild. Threading those three caches through
+  // QML instead is exactly where a wrong `prev` would go unnoticed (KD8).
+
+  property string tab: "today"
+  // Only what the user toggled away from the default: a plain section is expanded unless
+  // listed, a hidden one is collapsed unless listed. Api.isCollapsed owns that inversion.
+  property var toggledSections: []
+  property var view: Api.popupView(null, root.viewArgs)
+
+  readonly property var viewArgs: ({
+    allTasks: root.svc ? root.svc.allTasks : [],
+    tasks: root.svc ? root.svc.tasks : [],
+    projects: root.svc ? root.svc.projects : [],
+    tab: root.tab,
+    collapsed: root.toggledSections,
+    now: new Date()
+  })
+
+  function rebuild() {
+    root.view = Api.popupView(root.view, root.viewArgs)
+  }
+
+  onTabChanged: { resetCursor(); rebuild() }
+  onToggledSectionsChanged: rebuild()
+  onSvcChanged: rebuild()
+
+  Connections {
+    target: root.svc
+    function onChanged() { root.rebuild() }
+  }
+
+  // ---- States and footer ---------------------------------------------------
+
+  readonly property int windowCount: svc ? svc.allTasks.length : 0
+  readonly property string emptyReason: Api.emptyReason(root.svcStatus, root.windowCount,
+    root.view.hiddenTaskCount, root.view.count)
+
+  // Our own words for the class of failure. The service stores curl's stderr and the raw
+  // exception; neither reaches the screen (R23).
+  readonly property string emptyText: {
+    if (root.emptyReason === "no-token")
+      return "Нет токена. Положите его в " + (root.svc ? root.svc.settingsPath : "settings.json")
+    if (root.emptyReason === "error") {
+      var cls = Api.errorClass(root.svc ? root.svc.errorText : "")
+      if (cls === "auth") return "Токен не принят. Проверьте его в настройках SingularityApp"
+      if (cls === "network") return "Сервис не отвечает. Похоже на сеть"
+      if (cls === "response") return "Ответ пришёл в неожиданном виде"
+      return "Запрос не прошёл"
+    }
+    if (root.emptyReason === "loading") return "Загрузка"
+    if (root.emptyReason === "all-clear") return "Всё чисто"
+    if (root.emptyReason === "all-hidden")
+      return "Всё, что есть в окне, скрыто отсевом: задач " + root.view.hiddenTaskCount
+    if (root.emptyReason === "tab-empty") return "На этой вкладке пусто"
+    return ""
+  }
+
+  readonly property var unmatched: Api.unmatchedExcluded(
+    root.svc ? root.svc.projects : [], root.svc ? root.svc.excludedProjects : [])
+
+  readonly property string footerText: {
+    var parts = []
+    // Both directions have to be visible: without the first line an unfiltered list passes
+    // for a filtered one, without the second a day emptied by the filter looks like a day
+    // that was genuinely empty.
+    if (root.svc && !root.svc.filterApplied) {
+      var miss = root.unmatched.length > 0 ? " (не найдены: " + root.unmatched.join(", ") + ")" : ""
+      parts.push("Отсев не применён: список проектов ещё не загружен" + miss)
+    } else if (root.svc && root.svc.excludedCount > 0) {
+      parts.push("Скрыто задач: " + root.view.hiddenTaskCount)
+      if (root.unmatched.length > 0)
+        parts.push("в отсеве нет таких проектов: " + root.unmatched.join(", "))
+    }
+    if (root.updating) parts.push("обновляется")
+    else if (root.svc && root.svc.lastSync)
+      parts.push("обновлено в " + Qt.formatTime(new Date(root.svc.lastSync), "HH:mm"))
+    return parts.join(" · ")
+  }
+
+  // ---- Cursor --------------------------------------------------------------
+  //
+  // Three properties, per KTD4: where it sits, what it sits on, and whether the keyboard
+  // is driving. The id is what survives a rebuild — a row number does not, because a poll
+  // can insert a task above the selection.
+
+  property int cursorIndex: -1
+  property string cursorId: ""
+  property string cursorSection: ""
+  property bool cursorActive: false
+  // Last input wins. Without this a pointer resting over the list drags the selection back
+  // on every stray hover the moving rows generate under it.
+  property bool keyboardDrivingCursor: false
+
+  readonly property var cursorRow: cursorActive && cursorIndex >= 0
+    && cursorIndex < root.view.flat.length ? root.view.flat[cursorIndex] : null
+
+  function noteCursor() {
+    var row = root.cursorRow
+    root.cursorId = row ? row.id : ""
+    root.cursorSection = row ? row.key : ""
+    if (root.cursorIndex < 0) root.cursorActive = false
+  }
+
+  onViewChanged: {
+    if (!root.cursorActive) return
+    root.cursorIndex = Api.cursorIndexForId(root.view.flat, root.cursorId,
+                                            root.cursorIndex, root.cursorSection)
+    root.noteCursor()
+  }
+
+  function moveCursorBy(delta) {
+    if (root.view.flat.length === 0) return
+    root.keyboardDrivingCursor = true
+    root.cursorActive = true
+    root.cursorIndex = Api.moveCursor(root.cursorIndex, delta, root.view.flat.length)
+    root.noteCursor()
+  }
+
+  // Enter raises returnRequested and activateRequested back to back; Space raises only the
+  // second. The flag lets the pair act once (KTD8).
+  property bool suppressNextActivate: false
+
+  // A header folds; a task row does nothing. Reading a task is what the popup is for, and
+  // acting on one waits for SNG-3.1.
+  function activateCursor() {
+    var row = root.cursorRow
+    if (row && row.kind === "header") root.toggleSection(row.key)
+  }
+
+  function selectByHover(id) {
+    if (root.keyboardDrivingCursor) return
+    var index = Api.cursorIndexForId(root.view.flat, id, -1, null)
+    if (index < 0) return
+    root.cursorActive = true
+    root.cursorIndex = index
+    root.noteCursor()
+  }
+
+  function notePointerMoved(item, mouse, id) {
+    if (!pointerGate.moved(item, mouse)) return
+    root.keyboardDrivingCursor = false
+    root.selectByHover(id)
+  }
+
+  // Keeps the row under the cursor on screen as the arrows walk past the fold.
+  function ensureVisible(item) {
+    if (!item) return
+    var top = item.mapToItem(listColumn, 0, 0).y
+    var bottom = top + item.height
+    var pad = Style.space(8)
+    if (top - pad < listFlick.contentY)
+      listFlick.contentY = Math.max(0, top - pad)
+    else if (bottom + pad > listFlick.contentY + listFlick.height)
+      listFlick.contentY = Math.min(Math.max(0, listFlick.contentHeight - listFlick.height),
+                                    bottom + pad - listFlick.height)
+  }
+
+  PointerMoveGate {
+    id: pointerGate
+    referenceItem: listColumn
+  }
+
+  function toggleSection(key) {
+    var next = root.toggledSections.slice()
+    var at = next.indexOf(key)
+    if (at === -1) next.push(key)
+    else next.splice(at, 1)
+    root.toggledSections = next
+  }
+
+  function open() {
+    root.resetCursor()
+    root.controller.show()
+    root.rebuild()
+    root.refreshIfStale()
+  }
+
+  // Switching tabs rebuilds the list under the cursor; keeping an index there would land it
+  // on an unrelated row. Section folding does not reset — that is what R7 protects.
+  function resetCursor() {
+    root.cursorIndex = -1
+    root.cursorId = ""
+    root.cursorSection = ""
+    root.cursorActive = false
+    root.keyboardDrivingCursor = false
+    pointerGate.reset()
+    listFlick.contentY = 0
+  }
+
+  function close() {
+    root.controller.hide()
+  }
+
+  function toggle() {
+    if (root.opened) root.close()
+    else root.open()
+  }
+
+  function stepTab(delta) {
+    var at = Api.POPUP_TABS.indexOf(root.tab)
+    root.tab = Api.POPUP_TABS[Api.moveCursor(at, delta, Api.POPUP_TABS.length)]
+  }
+
+  function switchPanel(direction) {
+    if (root.bar && typeof root.bar.switchPanelFrom === "function")
+      return root.bar.switchPanelFrom(root.barIdentity, direction)
+    return false
+  }
+
+  // Opening asks for fresh data, and the footer says so — a silent refresh reads as the
+  // list moving on its own. An empty lastSync means nothing has ever come back, which is
+  // exactly the case that must poll.
+  function refreshIfStale() {
+    if (!svc || typeof svc.refresh !== "function") return
+    var last = svc.lastSync ? new Date(svc.lastSync).getTime() : 0
+    if (Date.now() - last < root.freshnessMs) return
+    svc.refresh()
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: root.anchorItem
+    owner: root.barIdentity
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(420))
+    // The tab strip stays put; only the list scrolls.
+    contentHeight: panel.fittedContentHeight(tabs.height + Style.space(18)
+      + Math.max(Math.min(listColumn.implicitHeight, Style.space(460)), emptyState.implicitHeight)
+      + footer.implicitHeight)
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      // The catcher folds h/l and the horizontal arrows into one signal, so horizontal
+      // carries exactly one meaning — the tabs. Folding sections lives on Enter (KD6).
+      onMoveRequested: function(dx, dy) {
+        if (dx !== 0) { root.stepTab(dx); return }
+        if (dy !== 0) root.moveCursorBy(dy)
+      }
+      onReturnRequested: {
+        root.suppressNextActivate = true
+        root.activateCursor()
+      }
+      onActivateRequested: {
+        if (root.suppressNextActivate) { root.suppressNextActivate = false; return }
+        root.activateCursor()
+      }
+
+      // ---- Tabs. Three slices of one cache, so switching costs no request.
+      ButtonGroup {
+        id: tabs
+        anchors.top: parent.top
+        anchors.horizontalCenter: parent.horizontalCenter
+        // Tab belongs to the panel walk, not to this group; the key catcher takes h/l
+        // before the group ever sees them.
+        focusable: false
+        cursorIndex: -1
+        options: [
+          { value: "today", label: "Сегодня" },
+          { value: "all", label: "Все" },
+          { value: "overdue", label: "Просрочено" }
+        ]
+        value: root.tab
+        foreground: root.contentForeground
+        background: Color.popups.background
+        fontFamily: root.contentFontFamily
+        onChanged: function(v) { root.tab = v }
+      }
+
+      // No ready-made empty state exists in Ui/, so it is a Text with a computed cause —
+      // and the cause is computed in Api.mjs, not by a chain of conditions here (KTD7).
+      Text {
+        id: emptyState
+        anchors.top: tabs.bottom
+        anchors.topMargin: Style.space(20)
+        anchors.left: parent.left
+        anchors.right: parent.right
+        horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.WordWrap
+        visible: root.emptyText !== ""
+        text: root.emptyText
+        color: root.emptyReason === "error" || root.emptyReason === "no-token"
+          ? Color.urgent : root.dim
+        font.family: root.contentFontFamily
+        font.pixelSize: Style.font.body
+        textFormat: Text.PlainText
+      }
+
+      Flickable {
+        id: listFlick
+        anchors.top: tabs.bottom
+        anchors.topMargin: Style.space(12)
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: footer.top
+        anchors.bottomMargin: Style.space(6)
+        visible: root.emptyText === ""
+        contentWidth: width
+        contentHeight: listColumn.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+
+        Column {
+          id: listColumn
+          width: listFlick.width
+          spacing: Style.space(4)
+
+          Repeater {
+            model: root.view.sections
+
+            // A section: header, then its rows unless collapsed. A hidden section — one the
+            // SNG-2 project filter dropped — sits in its place in the list, greyed and
+            // collapsed, and opens the same way any other does (R11, R12).
+            Column {
+              id: section
+              required property var modelData
+              readonly property bool collapsed: Api.isCollapsed(modelData, root.toggledSections)
+
+              width: listColumn.width
+              spacing: Style.space(2)
+
+              Item {
+                id: headerItem
+                width: parent.width
+                height: header.implicitHeight + Style.space(8)
+
+                // Identity, not an index: the delegate never has to know its place in the
+                // flat sequence, so no arithmetic can put the highlight on the wrong row.
+                readonly property bool hasCursor: root.cursorRow
+                  && root.cursorRow.kind === "header"
+                  && root.cursorRow.key === section.modelData.key
+
+                onHasCursorChanged: {
+                  if (hasCursor && root.keyboardDrivingCursor) root.ensureVisible(headerItem)
+                }
+
+                Rectangle {
+                  anchors.fill: parent
+                  radius: Style.cornerRadius
+                  color: headerItem.hasCursor || headerMouse.containsMouse
+                    ? Style.hoverFillFor(root.contentForeground, Color.accent) : "transparent"
+                }
+
+                Row {
+                  id: header
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  spacing: Style.space(8)
+
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    // Chevron: right when collapsed, down when open.
+                    text: section.collapsed ? "\uf054" : "\uf078"
+                    color: root.dim
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                    textFormat: Text.PlainText
+                  }
+
+                  PanelSectionHeader {
+                    anchors.verticalCenter: parent.verticalCenter
+                    // A hidden section is dimmer than a plain one, so "excluded by the
+                    // filter" is visible without opening it.
+                    foreground: section.modelData.hidden ? root.dim : root.contentForeground
+                    fontFamily: root.contentFontFamily
+                    text: section.modelData.title
+                    textFormat: Text.PlainText
+                  }
+
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: section.modelData.count
+                    color: root.dim
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                    textFormat: Text.PlainText
+                  }
+                }
+
+                MouseArea {
+                  id: headerMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  onPositionChanged: function(mouse) {
+                    root.notePointerMoved(headerItem, mouse, "header:" + section.modelData.key)
+                  }
+                  onClicked: root.toggleSection(section.modelData.key)
+                }
+              }
+
+              Repeater {
+                model: section.collapsed ? [] : section.modelData.tasks
+
+                TaskRow {
+                  id: taskRow
+                  required property var modelData
+                  width: section.width
+                  task: modelData
+                  overdue: Api.isOverdue(modelData, root.view.now)
+                  foreground: root.contentForeground
+                  fontFamily: root.contentFontFamily
+                  hasCursor: root.cursorRow && root.cursorRow.task === modelData
+
+                  onHasCursorChanged: {
+                    if (hasCursor && root.keyboardDrivingCursor) root.ensureVisible(taskRow)
+                  }
+                  onPointerMoved: function(mouse) {
+                    root.notePointerMoved(taskRow, mouse, "task:" + modelData.id)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      Column {
+        id: footer
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        spacing: Style.space(6)
+
+        PanelSeparator {
+          width: parent.width
+          visible: root.footerText !== ""
+          foreground: root.contentForeground
+        }
+
+        Text {
+          width: parent.width
+          visible: root.footerText !== ""
+          text: root.footerText
+          color: root.dim
+          wrapMode: Text.WordWrap
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          textFormat: Text.PlainText
+        }
+      }
+    }
+  }
+}

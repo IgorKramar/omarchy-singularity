@@ -6,8 +6,9 @@
 ![Omarchy](https://img.shields.io/badge/Omarchy-shell%20plugin-7aa2f7)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
-> **Status: in development.** The bar pill and the headless service work; the popup and the
-> overlay are not built yet.
+> **Status: in development.** The bar pill, the popup and the headless service work; the
+> overlay is not built yet, and the popup is read-only — checking off, inline edit and quick
+> add are still to come.
 
 ## What it will be
 
@@ -16,10 +17,55 @@ One plugin, three surfaces, one source of truth:
 | Surface | Kind | What it shows |
 | --- | --- | --- |
 | Bar pill | `bar-widget` | count of today's and overdue tasks |
-| Popup | `bar-widget` | tasks grouped by project, check off, inline edit, quick add |
+| Popup | `bar-widget` | tasks grouped by project, three tabs, full keyboard control (read-only for now) |
 | Overlay | `overlay` | full screen: Overdue / Today / Tomorrow columns, checklists, habits with streaks, time tracking |
 
 All API work — token, polling, cache — lives in a headless `service`. The bar widget and the overlay only render what the service holds, so the two never disagree.
+
+## The popup
+
+Clicking the pill opens the popup: the tasks the number is made of, grouped into collapsible
+sections by project. Three ways in — click the pill, press `Esc` or click again to close, or
+drive it from the shell:
+
+```bash
+omarchy-shell singularity.popup toggle   # also: open, close, show, hide
+```
+
+The IPC target is `singularity.popup`, separate from the service's own `singularity`, and it
+carries window commands only — never task titles or the cache. On a multi-monitor setup the
+popup opens on the focused output.
+
+Three tabs — **Сегодня**, **Все**, **Просрочено** — are three slices of the same cache, so
+switching between them never costs a request. "Все" is the whole window, exactly the number
+the pill shows. Overdue is recomputed from the current time rather than read off a flag
+frozen when the response was parsed, so a popup left open across midnight tells the truth.
+
+Opening asks the service for fresh data when the last sync is more than a minute old, and the
+footer says both that an update is running and when the last one landed.
+
+Projects excluded from the count (see below) are not omitted: each appears in its place as a
+dimmed, collapsed section, and opens like any other. The footer says how many **tasks** are
+hidden. Expanding one does not change any count.
+
+### Keyboard
+
+| Key | What it does |
+| --- | --- |
+| `↑` `↓` `k` `j` | move the selection through rows and section headers |
+| `←` `→` `h` `l` | switch tabs |
+| `Enter` `Space` | fold or unfold the selected section (nothing on a task row) |
+| `Tab` `Shift+Tab` | move to the neighbouring bar panel |
+| `Esc` | close |
+
+Tabs sit on the horizontal keys rather than on `Tab` because the shell's key dispatcher
+delivers `h`/`l` and the horizontal arrows as one signal: horizontal carries one meaning, and
+`Tab` keeps the meaning it has in every other panel of the shell. Folding therefore moved to
+`Enter`.
+
+The selection is held by task, not by row number — a task arriving above it does not shift it.
+When the selected task leaves the window, the selection moves to the next task in its own
+section, then the previous one, then the section header.
 
 ## Requirements
 
@@ -126,10 +172,12 @@ Validate from the checkout, not through the symlink — the validator treats a s
 
 ```bash
 omarchy plugin validate "$PWD"
-TZ=Asia/Omsk node --test          # Api.mjs unit tests, the same step CI runs
+TZ=Asia/Omsk node --test test/api.test.mjs   # the same step CI runs, file named on purpose
 ```
 
-`Api.mjs` is a plain ES module shared by QML and Node. The `qml` on `PATH` is Qt 5 and cannot load it; use `/usr/lib/qt6/bin/qml` for local QML checks.
+The test file is named explicitly: `node --test` exits 0 when it discovers no test files, so
+a rename would leave the job green at zero checks. `Api.mjs` is a plain ES module shared by
+QML and Node. The `qml` on `PATH` is Qt 5 and cannot load it; use `/usr/lib/qt6/bin/qml` for local QML checks.
 
 The API spec is public: <https://api.singularity-app.com/v2/api-json>.
 

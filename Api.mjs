@@ -351,8 +351,19 @@ export function popupView(prev, args) {
     sections = sameGroups(previous.sections, merged) ? previous.sections : merged
   }
   const flat = flattenGroups(previous.flat, sections, collapsed)
+  // Hand back the very same object when nothing moved, so QML's onViewChanged fires on a
+  // real change and not on every poll. The day is part of that comparison: an unchanged
+  // task set still changes which rows are overdue once midnight passes, and returning a
+  // stale `now` would freeze the marks until the next edit.
+  if (prev && prev.tab === tab && prev.groups === groups && prev.hidden === dropped.groups
+      && prev.sections === sections && prev.flat === flat
+      && prev.hiddenTaskCount === dropped.taskCount && prev.count === sliced.length
+      && startOfDay(prev.now).getTime() === startOfDay(now).getTime()) return prev
   return {
     tab,
+    // The `now` the slice used, so a row's overdue mark and its tab agree by construction
+    // rather than by two independent clock reads either side of midnight (R5).
+    now,
     groups,
     hidden: dropped.groups,
     sections,
@@ -360,4 +371,43 @@ export function popupView(prev, args) {
     hiddenTaskCount: dropped.taskCount,
     count: sliced.length
   }
+}
+
+// --- Popup states (SNG-3) ---
+
+// The service stores whatever curl wrote to stderr, or the exception it caught. R23 keeps
+// that out of the interface: the popup names the class and supplies its own wording. The
+// classification lives here rather than in QML because getting it wrong is silent — the
+// user sees a plausible sentence about the wrong thing.
+export function errorClass(errorText) {
+  const text = String(errorText || "").toLowerCase()
+  if (text === "") return "none"
+  if (/\b40[13]\b|unauthorized|forbidden/.test(text)) return "auth"
+  if (/could not resolve|connection refused|connection timed out|timed out|timeout|network is unreachable|\(6\)|\(7\)|\(28\)/.test(text))
+    return "network"
+  if (/not json|no tasks array|no projects array|unexpected token/.test(text)) return "response"
+  return "unknown"
+}
+
+// Names in the exclusion setting that match no project in the cache (R14). Silent when
+// unnamed: a typo in shell.json otherwise looks exactly like a filter that works.
+export function unmatchedExcluded(projects, excluded) {
+  const names = normalizeExcluded(excluded)
+  if (names.size === 0) return []
+  const known = new Set(projects.map((p) => String(p.title || "").trim().toLowerCase()))
+  return [...names].filter((n) => !known.has(n))
+}
+
+// Why the list is empty — and emptiness has several causes that must not wear each other's
+// words. In particular "all clear" and "hidden by the filter" are opposite facts (R26), so
+// the choice between them is decided here once instead of by a chain of conditions in QML.
+// `windowCount` is the full window before the filter; `tabCount` is what the tab shows.
+export function emptyReason(status, windowCount, hiddenTaskCount, tabCount) {
+  if (tabCount > 0) return ""
+  if (status === "no-token") return "no-token"
+  if (status === "error") return "error"
+  if (status === "loading" && windowCount === 0) return "loading"
+  if (windowCount === 0) return "all-clear"
+  if (hiddenTaskCount >= windowCount) return "all-hidden"
+  return "tab-empty"
 }

@@ -1,10 +1,11 @@
 import QtQuick
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
 // The bar face: one glyph, and the number of tasks in the "today and overdue" window.
 // All state belongs to Service.qml — this file reads it back and decides what to draw.
-// The popup is SNG-3; here a click only has to keep the widget interactive.
+// It also hosts the popup: a click opens Panel.qml, which the Loader below owns.
 BarWidget {
   id: root
   moduleName: "io.github.igorkramar.singularity"
@@ -30,9 +31,76 @@ BarWidget {
     if (svc) svc.excludedProjects = root.setting("excludedProjects", [])
   }
 
-  onSvcChanged: pushExcluded()
-  onSettingsChanged: pushExcluded()
+  onSvcChanged: { pushExcluded(); injectPanel() }
+  onSettingsChanged: { pushExcluded(); injectPanel() }
+  onBarChanged: injectPanel()
   Component.onCompleted: pushExcluded()
+
+  // ---- Popup. The shape Bar.findPanelWidget duck-types a panel by: open, close and
+  //      opened have to live on the bar-widget root, not on the nested panel.
+  readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
+
+  function open() { if (panelLoader.item) panelLoader.item.open() }
+  function close() { if (panelLoader.item) panelLoader.item.close() }
+  function togglePanel() { if (panelLoader.item) panelLoader.item.toggle() }
+
+  // Forwarded so this widget can stand in for the panel as the bar's popout identity:
+  // Bar.requestPopout prefers closeForPopoutSwitch over close, and KeyboardPanel reads
+  // popoutSwitchClosing back off its owner.
+  readonly property bool popoutSwitchClosing: panelLoader.item
+    ? panelLoader.item.popoutSwitchClosing === true : false
+
+  function closeForPopoutSwitch() {
+    if (panelLoader.item) panelLoader.item.closeForPopoutSwitch()
+  }
+
+  function injectPanel() {
+    var target = panelLoader.item
+    if (!target) return
+    if ("bar" in target) target.bar = root.bar
+    if ("settings" in target) target.settings = root.settings
+    if ("anchorItem" in target) target.anchorItem = button
+    if ("hostWidget" in target) target.hostWidget = root
+    if ("svc" in target) target.svc = root.svc
+  }
+
+  // A fixed IPC target is claimed by exactly one of the per-monitor instances, so the
+  // handler must not open the popup at itself — it asks the bar to pick the slot on the
+  // focused output, the same way the shell routes its own panel hotkeys.
+  function routePopup(action) {
+    if (!root.bar) return
+    if (action === "toggle")
+      return root.bar.isBarWidgetOpen(root.moduleName)
+        ? root.bar.hideBarWidget(root.moduleName)
+        : root.bar.summonBarWidget(root.moduleName)
+    if (action === "open") return root.bar.summonBarWidget(root.moduleName)
+    return root.bar.hideBarWidget(root.moduleName)
+  }
+
+  Loader {
+    id: panelLoader
+    active: true
+    source: Qt.resolvedUrl("Panel.qml")
+    visible: false
+    onLoaded: {
+      root.injectPanel()
+      // `bar` and `settings` arrive after construction, so once is not enough.
+      Qt.callLater(root.injectPanel)
+    }
+  }
+
+  // `singularity` already belongs to the service's handler, and the shell allows one
+  // handler per target — hence a name of its own. Only window commands pass through it:
+  // no task titles, no project names, no cache.
+  IpcHandler {
+    target: "singularity.popup"
+
+    function open(): void { root.routePopup("open") }
+    function close(): void { root.routePopup("close") }
+    function show(): void { root.routePopup("open") }
+    function hide(): void { root.routePopup("close") }
+    function toggle(): void { root.routePopup("toggle") }
+  }
 
   readonly property string glyph: {
     if (!svc || root.svcStatus === "loading") return "\uf252"   // песочные часы
@@ -84,8 +152,8 @@ BarWidget {
     activeColor: root.bar ? root.bar.urgent : Color.urgent
     tooltipText: root.tooltipText
     onPressed: function(b) {
-      // The popup arrives with SNG-3. Until then the middle button is the one useful action.
-      if (b === Qt.MiddleButton && root.svc) root.svc.refresh()
+      if (b === Qt.MiddleButton) { if (root.svc) root.svc.refresh() }
+      else root.togglePanel()
     }
   }
 }

@@ -7,7 +7,8 @@ import {
   isOverdue, normalizeExcluded, applyProjectFilter, countWindow,
   computeView, excludedList,
   sliceByTab, groupByProject, hiddenGroups, isCollapsed, flattenGroups,
-  moveCursor, cursorIndexForId, popupView
+  moveCursor, cursorIndexForId, popupView,
+  errorClass, unmatchedExcluded, emptyReason
 } from "../Api.mjs"
 
 // Фиксированный «сейчас»: 3 сентября 2026, полдень, локальная зона машины.
@@ -465,4 +466,46 @@ test("popupView: скрытые секции стоят в списке вмес
   })
   assert.deepEqual(view.sections.map((g) => [g.title, g.hidden]), [["Дача", true], ["Работа", false]])
   assert.deepEqual(view.flat.map((r) => r.kind), ["header", "header", "task"])
+})
+
+test("popupView отдаёт тот же объект, пока ничего не двигалось, и новый после полуночи", () => {
+  const all = [t("A", { projectId: "P-1" })]
+  const args = { allTasks: all, tasks: all, projects: projectsFixture, tab: "all", collapsed: [], now }
+  const first = popupView(null, args)
+  assert.equal(popupView(first, args), first, "тихий опрос не должен перестраивать список")
+  const nextDay = popupView(first, { ...args, now: new Date(2026, 8, 4, 12, 0, 0) })
+  assert.notEqual(nextDay, first, "новые сутки меняют разметку просрочки при тех же задачах")
+})
+
+test("errorClass разбирает сырой stderr по классам, а не пересказывает его", () => {
+  assert.equal(errorClass("curl: (22) The requested URL returned error: 401"), "auth")
+  assert.equal(errorClass("curl: (6) Could not resolve host: api.singularity-app.com"), "network")
+  assert.equal(errorClass("curl: (28) Operation timed out after 15000 milliseconds"), "network")
+  assert.equal(errorClass("response is not JSON: Unexpected token <"), "response")
+  assert.equal(errorClass("response has no tasks array"), "response")
+  assert.equal(errorClass("что-то пошло не так"), "unknown")
+  assert.equal(errorClass(""), "none")
+  assert.equal(errorClass(null), "none")
+})
+
+test("unmatchedExcluded называет то, что в настройке есть, а среди проектов нет", () => {
+  assert.deepEqual(unmatchedExcluded(projectsFixture, ["Дача", "Даччя"]), ["даччя"])
+  assert.deepEqual(unmatchedExcluded(projectsFixture, ["Дача"]), [])
+  assert.deepEqual(unmatchedExcluded([], ["Дача"]), ["дача"], "пустой кэш проектов — не совпало ничего")
+  assert.deepEqual(unmatchedExcluded(projectsFixture, []), [])
+})
+
+test("emptyReason: пять видов пустоты не подменяют друг друга", () => {
+  assert.equal(emptyReason("ready", 3, 0, 2), "", "непустая вкладка причины не требует")
+  assert.equal(emptyReason("no-token", 0, 0, 0), "no-token")
+  assert.equal(emptyReason("error", 0, 0, 0), "error")
+  assert.equal(emptyReason("loading", 0, 0, 0), "loading")
+  assert.equal(emptyReason("ready", 0, 0, 0), "all-clear")
+  assert.equal(emptyReason("ready", 3, 3, 0), "all-hidden", "«всё чисто» и «скрыто N» вместе не идут")
+  assert.equal(emptyReason("ready", 3, 1, 0), "tab-empty", "окно не пусто, пуст разрез вкладки")
+})
+
+test("emptyReason: пришедший кэш важнее состояния загрузки", () => {
+  assert.equal(emptyReason("loading", 3, 3, 0), "all-hidden")
+  assert.equal(emptyReason("loading", 3, 0, 0), "tab-empty")
 })
