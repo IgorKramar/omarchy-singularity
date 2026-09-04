@@ -46,19 +46,26 @@ Panel {
   // Only what the user toggled away from the default: a plain section is expanded unless
   // listed, a hidden one is collapsed unless listed. Api.isCollapsed owns that inversion.
   property var toggledSections: []
-  property var view: Api.popupView(null, root.viewArgs)
+  property var view: Api.popupView(null, root.viewArgs())
 
-  readonly property var viewArgs: ({
-    allTasks: root.svc ? root.svc.allTasks : [],
-    tasks: root.svc ? root.svc.tasks : [],
-    projects: root.svc ? root.svc.projects : [],
-    tab: root.tab,
-    collapsed: root.toggledSections,
-    now: new Date()
-  })
+  // A function, not a property: a property binding is not guaranteed to be resolved when
+  // `view`'s own initializer runs, and popupView then destructures undefined and throws.
+  // The engine reports that as a warning, keeps the old value and carries on — the panel
+  // still drew correctly, which is precisely why the fault had to be read out of the log
+  // rather than seen. Functions exist before any binding evaluates.
+  function viewArgs() {
+    return {
+      allTasks: root.svc ? root.svc.allTasks : [],
+      tasks: root.svc ? root.svc.tasks : [],
+      projects: root.svc ? root.svc.projects : [],
+      tab: root.tab,
+      collapsed: root.toggledSections,
+      now: new Date()
+    }
+  }
 
   function rebuild() {
-    root.view = Api.popupView(root.view, root.viewArgs)
+    root.view = Api.popupView(root.view, root.viewArgs())
   }
 
   onTabChanged: { resetCursor(); rebuild() }
@@ -268,8 +275,7 @@ Panel {
     contentWidth: panel.fittedContentWidth(Style.space(420))
     // The tab strip stays put; only the list scrolls.
     contentHeight: panel.fittedContentHeight(tabs.height + Style.space(18)
-      + Math.max(Math.min(listColumn.implicitHeight, Style.space(460)), emptyState.implicitHeight)
-      + footer.implicitHeight)
+      + Math.min(listColumn.implicitHeight, Style.space(460)) + footer.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -313,25 +319,6 @@ Panel {
         onChanged: function(v) { root.tab = v }
       }
 
-      // No ready-made empty state exists in Ui/, so it is a Text with a computed cause —
-      // and the cause is computed in Api.mjs, not by a chain of conditions here (KTD7).
-      Text {
-        id: emptyState
-        anchors.top: tabs.bottom
-        anchors.topMargin: Style.space(20)
-        anchors.left: parent.left
-        anchors.right: parent.right
-        horizontalAlignment: Text.AlignHCenter
-        wrapMode: Text.WordWrap
-        visible: root.emptyText !== ""
-        text: root.emptyText
-        color: root.emptyReason === "error" || root.emptyReason === "no-token"
-          ? Color.urgent : root.dim
-        font.family: root.contentFontFamily
-        font.pixelSize: Style.font.body
-        textFormat: Text.PlainText
-      }
-
       Flickable {
         id: listFlick
         anchors.top: tabs.bottom
@@ -340,7 +327,6 @@ Panel {
         anchors.right: parent.right
         anchors.bottom: footer.top
         anchors.bottomMargin: Style.space(6)
-        visible: root.emptyText === ""
         contentWidth: width
         contentHeight: listColumn.implicitHeight
         clip: true
@@ -352,6 +338,27 @@ Panel {
           id: listColumn
           width: listFlick.width
           spacing: Style.space(4)
+
+          // No ready-made empty state exists in Ui/, so it is a Text with a computed cause —
+          // and the cause is computed in Api.mjs, not by a chain of conditions here (KTD7).
+          // It sits inside the list rather than over it: when the whole window is hidden by
+          // the filter, the message and the collapsed hidden sections have to coexist, or
+          // R12 has nothing left to expand.
+          Text {
+            id: emptyState
+            width: listColumn.width
+            topPadding: Style.space(14)
+            bottomPadding: Style.space(10)
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+            visible: root.emptyText !== ""
+            text: root.emptyText
+            color: root.emptyReason === "error" || root.emptyReason === "no-token"
+              ? Color.urgent : root.dim
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.body
+            textFormat: Text.PlainText
+          }
 
           Repeater {
             model: root.view.sections
@@ -450,7 +457,13 @@ Panel {
                   overdue: Api.isOverdue(modelData, root.view.now)
                   foreground: root.contentForeground
                   fontFamily: root.contentFontFamily
-                  hasCursor: root.cursorRow && root.cursorRow.task === modelData
+                  // By id, not by object identity: the task object reaches this delegate
+                  // through two nested `var` properties, and QML does not promise the same
+                  // reference comes out the far end. The section header above compares keys
+                  // and highlighted correctly while this row, comparing references, stayed
+                  // dark — the cursor was moving all along.
+                  hasCursor: root.cursorRow && root.cursorRow.kind === "task"
+                    && root.cursorRow.id === "task:" + modelData.id
 
                   onHasCursorChanged: {
                     if (hasCursor && root.keyboardDrivingCursor) root.ensureVisible(taskRow)

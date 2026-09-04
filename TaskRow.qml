@@ -32,7 +32,11 @@ Item {
   readonly property string deadlineLabel: {
     if (!task || !task.deadline) return ""
     var d = new Date(task.deadline)
-    return isNaN(d.getTime()) ? "" : Qt.formatDate(d, "d MMM")
+    // The interface of this plugin is Russian, so the month is too. The system locale here
+    // is English and would print "2 Sep" beside "Просрочено".
+    // toLocaleDateString, not Qt.formatDate: the latter takes no locale and would print
+    // "2 Sep" from the system locale beside a Russian interface.
+    return isNaN(d.getTime()) ? "" : d.toLocaleDateString(Qt.locale("ru_RU"), "d MMM")
   }
 
   implicitHeight: line.implicitHeight + Style.space(8)
