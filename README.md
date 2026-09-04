@@ -17,7 +17,7 @@ One plugin, three surfaces, one source of truth:
 | Surface | Kind | What it shows |
 | --- | --- | --- |
 | Bar pill | `bar-widget` | count of today's and overdue tasks |
-| Popup | `bar-widget` | tasks grouped by project, three tabs, full keyboard control (read-only for now) |
+| Popup | `bar-widget` | tasks grouped by project, three tabs, full keyboard control, complete / rename / add |
 | Overlay | `overlay` | full screen: Overdue / Today / Tomorrow columns, checklists, habits with streaks, time tracking |
 
 All API work — token, polling, cache — lives in a headless `service`. The bar widget and the overlay only render what the service holds, so the two never disagree.
@@ -48,15 +48,46 @@ Projects excluded from the count (see below) are not omitted: each appears in it
 dimmed, collapsed section, and opens like any other. The footer says how many **tasks** are
 hidden. Expanding one does not change any count.
 
+### Acting on a task
+
+Every task row carries a checkbox. Click it, or press `Space` with the row selected, and the
+task is completed. Clicking the row itself — or `Enter` — opens it: the note, whichever fields
+carry a value, and a link out to the web app. One task is open at a time.
+
+The checkbox does not tick on its own the moment you press it. A round trip to the API takes
+about half a second, and a task that vanished before the server confirmed would have to come
+back on failure — so the row keeps its place and wears a "sent" mark until the answer lands.
+A write that fails says so in the footer and leaves the list alone; it never repaints the
+popup as a broken service, because one checkbox that did not save is not an outage.
+
+**A recurring task shows a repeat glyph instead of a checkbox.** Such a task is two objects in
+SingularityApp — a generator and the instances it produces — and completing an instance
+through this API is not something the API offers. A dimmed checkbox would still read as a
+checkbox, so the slot carries a different mark rather than a disabled one.
+
+Renaming happens in place: `e` turns the title into a field with the text selected. A new task
+goes in the field at the bottom of the list, which `n` jumps to from anywhere; it lands in
+Входящие with today's date. Both fields keep what you typed until the server confirms — a
+failed write leaves the text where you can retry it — and `Esc` backs out of either without
+sending anything.
+
 ### Keyboard
 
 | Key | What it does |
 | --- | --- |
 | `↑` `↓` `k` `j` | move the selection through rows and section headers |
 | `←` `→` `h` `l` | switch tabs |
-| `Enter` `Space` | fold or unfold the selected section (nothing on a task row) |
+| `Enter` | unfold a section, or open the selected task |
+| `Space` | complete the selected task (fold/unfold on a section header) |
+| `e` `у` | rename the selected task in place |
+| `n` `т` | jump to the new-task field at the bottom |
+| `o` `щ` | open the selected task's project in the web app |
 | `Tab` `Shift+Tab` | move to the neighbouring bar panel |
-| `Esc` | close |
+| `Esc` | leave the field, or close the popup |
+
+The letter commands answer to their Cyrillic twins by key position. The tasks here are written
+in Russian, so the layout is Russian while reading them — a command bound to the Latin letter
+alone goes silent exactly when it is wanted.
 
 Tabs sit on the horizontal keys rather than on `Tab` because the shell's key dispatcher
 delivers `h`/`l` and the horizontal arrows as one signal: horizontal carries one meaning, and
