@@ -235,14 +235,8 @@ Panel {
     listFlick.contentY = 0
   }
 
-  function close() {
-    root.controller.hide()
-  }
-
-  function toggle() {
-    if (root.opened) root.close()
-    else root.open()
-  }
+  // close() и toggle() не переопределяются: базовый Ui/Panel даёт их дословно, а вызов
+  // open() внутри базового toggle() разрешается на переопределение ниже — проверено.
 
   function stepTab(delta) {
     var at = Api.POPUP_TABS.indexOf(root.tab)

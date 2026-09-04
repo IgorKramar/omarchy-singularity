@@ -16,8 +16,6 @@ Item {
   property color foreground: Color.foreground
   property string fontFamily: Style.font.family
 
-  signal clicked()
-  signal hovered(bool isHovered)
   signal pointerMoved(var mouse)
 
   readonly property color dim: Qt.darker(foreground, 1.6)
@@ -32,10 +30,8 @@ Item {
   readonly property string deadlineLabel: {
     if (!task || !task.deadline) return ""
     var d = new Date(task.deadline)
-    // The interface of this plugin is Russian, so the month is too. The system locale here
-    // is English and would print "2 Sep" beside "Просрочено".
-    // toLocaleDateString, not Qt.formatDate: the latter takes no locale and would print
-    // "2 Sep" from the system locale beside a Russian interface.
+    // toLocaleDateString, not Qt.formatDate: the latter takes no locale, and the system
+    // locale here is English — it would print "2 Sep" beside a Russian interface.
     return isNaN(d.getTime()) ? "" : d.toLocaleDateString(Qt.locale("ru_RU"), "d MMM")
   }
 
@@ -108,12 +104,13 @@ Item {
     }
   }
 
+  // hoverEnabled, хотя наведение само по себе ничего не красит: без него
+  // onPositionChanged срабатывает только при зажатой кнопке, а курсор ведётся
+  // именно движением указателя. Клик остаётся проглоченным намеренно — иначе он
+  // дошёл бы до слоя закрытия и захлопнул попап.
   MouseArea {
     anchors.fill: parent
     hoverEnabled: true
-    onEntered: root.hovered(true)
-    onExited: root.hovered(false)
     onPositionChanged: function(mouse) { root.pointerMoved(mouse) }
-    onClicked: root.clicked()
   }
 }

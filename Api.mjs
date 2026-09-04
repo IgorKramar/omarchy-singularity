@@ -284,7 +284,7 @@ export function hiddenGroups(prev, allTasks, tasks, projects) {
 // A hidden section defaults to collapsed and a plain one to expanded, so the set the panel
 // keeps holds only what the user actually toggled — one set, two defaults (R11, R12).
 export function isCollapsed(group, toggled) {
-  const has = (Array.isArray(toggled) ? toggled : []).indexOf(group.key) !== -1
+  const has = (Array.isArray(toggled) ? toggled : []).includes(group.key)
   return group.hidden ? !has : has
 }
 
