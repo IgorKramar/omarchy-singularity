@@ -25,6 +25,15 @@ Item {
   signal pointerMoved(var mouse)
   signal completeRequested()
   signal expandRequested()
+  signal renameAccepted(string title)
+  signal renameCancelled()
+
+  // Owned by the panel, not by this row: the field lives two Repeaters deep, and the
+  // panel has no reference to reach it with. It sets the flag, the row shows the field.
+  property bool renaming: false
+  // While a rename is in flight the field stays put and keeps what was typed — a failure
+  // that silently discarded the text would cost the user the edit twice over.
+  property bool renameSending: false
 
   readonly property color dim: Qt.darker(foreground, 1.6)
 
@@ -122,19 +131,47 @@ Item {
       textFormat: Text.PlainText
     }
 
-    Text {
-      id: title
+    Item {
+      id: titleSlot
       anchors.verticalCenter: parent.verticalCenter
       // Takes what the marks to its right leave; a long title elides rather than pushing
       // the deadline off the panel.
       width: Math.max(0, line.width - marks.width - box.width - line.spacing
         * (marks.width > 0 ? 3 : 2) - (root.overdue ? Style.space(16) : 0))
-      text: root.task ? root.task.title : ""
-      color: root.foreground
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.body
-      elide: Text.ElideRight
-      textFormat: Text.PlainText
+      height: Math.max(title.implicitHeight, renameField.visible ? renameField.implicitHeight : 0)
+
+      Text {
+        id: title
+        anchors.verticalCenter: parent.verticalCenter
+        width: parent.width
+        visible: !root.renaming
+        text: root.task ? root.task.title : ""
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        elide: Text.ElideRight
+        textFormat: Text.PlainText
+      }
+
+      TextField {
+        id: renameField
+        anchors.verticalCenter: parent.verticalCenter
+        width: parent.width
+        visible: root.renaming
+        enabled: !root.renameSending
+        onAccepted: root.renameAccepted(text)
+        // TextField carries no Escape handling of its own, and while the catcher is
+        // blocked it only passes the key through — without this the user would be shut
+        // inside the field with no way back to the list.
+        Keys.onEscapePressed: root.renameCancelled()
+
+        onVisibleChanged: {
+          if (!visible) return
+          text = root.task ? root.task.title : ""
+          forceActiveFocus()
+          selectAll()
+        }
+      }
     }
 
     Row {

@@ -132,6 +132,47 @@ Panel {
     root.expandedId = root.expandedId === task.id ? "" : task.id
   }
 
+  // The panel owns which row is being renamed, because the field itself lives two
+  // Repeaters deep and nothing up here can hold a reference to it (KTD12).
+  property string renamingId: ""
+  property string addDraft: ""
+
+  readonly property bool addSending: root.svc && root.svc.mutatingId === "new"
+
+  function startRename(task) {
+    if (!task || !root.svc) return
+    root.expandedId = ""
+    root.renamingId = task.id
+  }
+
+  function cancelRename() {
+    root.renamingId = ""
+    keyCatcher.forceActiveFocus()
+  }
+
+  function commitRename(task, title) {
+    if (!root.svc || !task) return
+    // The field is not closed here: it closes on `mutated`, so a rename that failed leaves
+    // the text where the user can see and retry it rather than silently reverting.
+    if (!root.svc.rename(task.id, title)) root.cancelRename()
+  }
+
+  function submitAdd() {
+    if (!root.svc) return
+    if (root.addDraft.trim() === "") return
+    root.svc.add(root.addDraft)
+  }
+
+  // Only a confirmed write clears the field or closes the editor. Doing it on submit
+  // would throw away the text on the one path where the user still needs it.
+  Connections {
+    target: root.svc
+    function onMutated(id, op) {
+      if (op === "create") root.addDraft = ""
+      else if (op === "rename" && id === root.renamingId) root.cancelRename()
+    }
+  }
+
   function openWeb(url) {
     // execArgv, not a shell string: the URL is built from API data, and the constant
     // `exec "$@"` keeps it a single argument no matter what it contains.
@@ -333,7 +374,28 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
 
+      // Blocked by panel state, not by a reference to the field: the rename field is two
+      // Repeaters deep. While blocked the catcher forwards every key untouched, which is
+      // why each field carries its own Escape.
+      blocked: root.renamingId !== "" || addField.activeFocus
+
       onCloseRequested: root.close()
+      // Letters the catcher does not spend itself: j/k/h/l walk, x deletes, so e/n/o are
+      // free. Named here rather than in the catcher — they mean something only to a list
+      // of tasks.
+      //
+      // Each one answers to its Cyrillic twin as well, by physical key position. The tasks
+      // in this popup are written in Russian, so the layout is Russian while reading them —
+      // and a command that only answers to the Latin letter is a command that does nothing
+      // exactly when it is wanted. Caught live: `n` typed a «п» into the field instead of
+      // opening it.
+      onTextKey: function(text) {
+        var row = root.cursorRow
+        var key = ({ "у": "e", "т": "n", "щ": "o" })[text] || text
+        if (key === "e" && row && row.kind === "task") root.startRename(row.task)
+        else if (key === "n") addField.forceActiveFocus()
+        else if (key === "o" && row && row.kind === "task") root.openWeb(Api.taskWebUrl(row.task).url)
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       // The catcher folds h/l and the horizontal arrows into one signal, so horizontal
       // carries exactly one meaning — the tabs. Folding sections lives on Enter (KD6).
@@ -536,6 +598,11 @@ Panel {
                       root.notePointerMoved(taskRow, mouse, "task:" + rowGroup.modelData.id)
                     }
                     onExpandRequested: root.toggleExpanded(rowGroup.modelData)
+                    renaming: root.renamingId === rowGroup.modelData.id
+                    renameSending: root.svc
+                      && root.svc.pendingIds.indexOf(rowGroup.modelData.id) !== -1
+                    onRenameAccepted: function(t) { root.commitRename(rowGroup.modelData, t) }
+                    onRenameCancelled: root.cancelRename()
                   }
 
                   // Loaded only while open. The block carries a Repeater and parses the
@@ -569,8 +636,43 @@ Panel {
 
         PanelSeparator {
           width: parent.width
-          visible: root.footerText !== ""
           foreground: root.contentForeground
+        }
+
+        // Always present, at the bottom, where a new task goes. `n` puts the cursor here
+        // from anywhere in the list.
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+
+        TextField {
+          id: addField
+          width: parent.width - (root.addSending ? sendingMark.width + Style.space(6) : 0)
+          enabled: root.svc && root.svc.apiToken !== "" && !root.addSending
+          placeholderText: root.addSending ? "отправляется…" : "новая задача во Входящие"
+          text: root.addDraft
+          onTextChanged: root.addDraft = text
+          onAccepted: root.submitAdd()
+          // The catcher is blocked while this field has focus, so its own Escape never
+          // fires here; without this the field would keep the keyboard for good.
+          Keys.onEscapePressed: {
+            root.addDraft = ""
+            keyCatcher.forceActiveFocus()
+          }
+        }
+
+          // The same mark the row wears while its own write is in flight. Without it the
+          // half second after Enter looks exactly like a key that did nothing.
+          Text {
+            id: sendingMark
+            anchors.verticalCenter: parent.verticalCenter
+            visible: root.addSending
+            text: "\uf110"
+            color: Color.accent
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            textFormat: Text.PlainText
+          }
         }
 
         Text {
