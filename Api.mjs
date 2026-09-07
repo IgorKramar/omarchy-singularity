@@ -117,10 +117,6 @@ export function isCurrent(task, now) {
   return new Date(task.start).getTime() <= endOfDayDate(now).getTime()
 }
 
-// Replace by id, then keep only what still belongs to today. Used for full fetches (cache = [])
-// and increments alike, so the window has exactly one owner.
-// Returns the same `cache` reference when nothing changed, so a QML `var` property
-// assignment does not fire a notify on every quiet poll.
 const byStartThenTitle = (a, b) =>
   a.start < b.start ? -1 : a.start > b.start ? 1 : a.title.localeCompare(b.title)
 

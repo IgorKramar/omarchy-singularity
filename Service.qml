@@ -22,7 +22,7 @@ Item {
   property string errorText: ""
   // The full window as the API sees it. Merging and the quiet gate work on this, never on
   // `tasks`: merging onto the filtered view would drop excluded tasks out of the cache for
-  // good, and clearing the filter would not bring them back until the next full poll.
+  // good, and clearing the filter would not bring them back until the next poll.
   property var allTasks: []
   // The filtered view every surface reads — the filter applies plugin-wide by construction.
   property var tasks: []
@@ -116,8 +116,8 @@ Item {
   }
 
   onExcludedProjectsChanged: {
-    // A list set before projects have ever arrived would silently do nothing; ask for the
-    // full fetch whose tail carries them.
+    // A list set before projects have ever arrived would silently do nothing; ask for a
+    // poll, whose tail is what fetches the project names.
     if (Api.normalizeExcluded(root.excludedProjects).size > 0
         && root.projects.length === 0 && root.apiToken !== "") {
       root.projectsFetchPending = true
@@ -377,7 +377,7 @@ Item {
     }
   }
 
-  // Projects ride on the tail of a successful full fetch; a failure here is reported
+  // Projects ride on the tail of a successful task poll; a failure here is reported
   // but neither changes `status` nor clears the project cache.
   Process {
     id: projectProc
@@ -404,7 +404,7 @@ Item {
         }
       }
       root.inFlight = false
-      root.recompute()   // names become resolvable only now, on the first full poll
+      root.recompute()   // names become resolvable only now, on the first project fetch
       root.changed()
       root.drainPending()
     }
