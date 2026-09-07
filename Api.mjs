@@ -39,8 +39,14 @@ export function endOfDay(now) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T23:59:59${localOffset(d)}`
 }
 
-export function todayQuery(now) {
-  return { "checked.eq": 0, "start.lte": endOfDay(now), maxCount: MAX_COUNT, fields: TASK_FIELDS.join(",") }
+// Every unfinished task, with no window on `start` at all. The narrow "up to the end of
+// today" window still exists — it is what the pill counts and the popup shows — but it is
+// applied on this side now (narrowWindow), because the overlay needs what the filter used to
+// drop: the 188 tasks with no start at all, and tomorrow's.
+//
+// Measured 07.09: this answers 192 tasks against the windowed 2, well inside maxCount=1000.
+export function taskQuery() {
+  return { "checked.eq": 0, maxCount: MAX_COUNT, fields: TASK_FIELDS.join(",") }
 }
 
 export function projectsQuery() {
@@ -110,9 +116,17 @@ export function parseProjects(text) {
   return data.projects.map((p) => ({ id: String(p.id), title: String(p.title || "") }))
 }
 
-// The "today" predicate: unchecked, alive, not deferred, planned no later than the local end of day.
+// What the cache holds: unchecked, alive, not deferred. Nothing about `start` — a task with
+// no date is the overlay's whole subject matter (SNG-4, R10).
+export function isCached(task) {
+  return task.checked === 0 && !task.deleteDate && !task.deferred
+}
+
+// The "today" predicate: cached, and planned no later than the local end of day. This is the
+// rule the pill and the popup have always used, unchanged; SNG-4 only moved where it applies
+// — from the fetch to narrowWindow — so that widening the cache leaves both surfaces alone.
 export function isCurrent(task, now) {
-  if (task.checked !== 0 || task.deleteDate || task.deferred) return false
+  if (!isCached(task)) return false
   if (!task.start) return false
   return new Date(task.start).getTime() <= endOfDayDate(now).getTime()
 }
@@ -121,16 +135,24 @@ export function isCurrent(task, now) {
 // answer in. `merge` used to get that stability for free from its Map of the cache; the poll
 // builds from the response alone, so two tasks sharing a start and a title would otherwise
 // swap places between polls — and swapping rows are what a user reads as a glitch.
-const byStartThenTitle = (a, b) =>
-  a.start < b.start ? -1 : a.start > b.start ? 1
-    : a.title.localeCompare(b.title) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+const byStartThenTitle = (a, b) => {
+  // A task with no start compares to a dated one as neither less nor greater: both
+  // `null < "2026-…"` and its reverse are false. Left to that, the two would keep whatever
+  // order the server answered in, and swap between polls — which reads as a glitch. Undated
+  // tasks sort last, said outright. (They only reach here since SNG-4 widened the cache.)
+  const as = a.start || "", bs = b.start || ""
+  if (as === "" || bs === "") {
+    if (as !== bs) return as === "" ? 1 : -1
+  } else if (as !== bs) return as < bs ? -1 : 1
+  return a.title.localeCompare(b.title) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+}
 
 // Merges one answer into the cache by id. Used by the write path, where the response is a
 // single task and the rest of the window must survive. The poll uses mergeFull instead.
 export function merge(cache, incoming, now) {
   const byId = new Map(cache.map((t) => [t.id, t]))
   for (const t of incoming) byId.set(t.id, t)
-  const next = [...byId.values()].filter((t) => isCurrent(t, now)).sort(byStartThenTitle)
+  const next = [...byId.values()].filter(isCached).sort(byStartThenTitle)
   return sameTasks(cache, next) ? cache : next
 }
 
@@ -142,9 +164,23 @@ export function merge(cache, incoming, now) {
 // absence is what the first draft of SNG-7 missed — calling `merge([], incoming)` would have
 // compared the new set against an empty literal, never matched, and rebuilt the popup every
 // ten minutes with a quiet-gate check in the code that could not fire.
-export function mergeFull(prev, incoming, now) {
-  const next = incoming.filter((t) => isCurrent(t, now)).sort(byStartThenTitle)
+export function mergeFull(prev, incoming) {
+  const next = incoming.filter(isCached).sort(byStartThenTitle)
   return sameTasks(prev, next) ? prev : next
+}
+
+// The narrow window, carved out of the wide cache. Everything downstream of the service —
+// the pill's number, the popup's list, the IPC payload — reads this and not the cache, so
+// widening the fetch changed nothing for them. Returns the previous reference when the
+// window did not move, because a fresh array on every poll is what the quiet gate exists to
+// prevent.
+export function narrowWindow(prev, tasks, now) {
+  // QML hands `[]` on the first pass, a test may hand null; either way there is nothing to
+  // hold on to, so the gate simply does not fire.
+  const previous = Array.isArray(prev) ? prev : []
+  const next = tasks.filter((t) => isCurrent(t, now))
+  const window = next.length === tasks.length ? tasks : next
+  return sameTasks(previous, window) ? previous : window
 }
 
 function sameTasks(a, b) {

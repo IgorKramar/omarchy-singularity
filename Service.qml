@@ -23,6 +23,12 @@ Item {
   // The full window as the API sees it. Merging and the quiet gate work on this, never on
   // `tasks`: merging onto the filtered view would drop excluded tasks out of the cache for
   // good, and clearing the filter would not bring them back until the next poll.
+  // Two windows, on purpose. `cachedTasks` is every unfinished task — the overlay's subject
+  // matter, 188 of which carry no date at all. `allTasks` is the narrow "up to the end of
+  // today" window carved out of it, and it is what every older surface reads: the pill's
+  // number, the popup, the IPC payload. Widening the fetch without this split would have
+  // told the popup that 188 tasks were hidden by the project filter (SNG-4, R10).
+  property var cachedTasks: []
   property var allTasks: []
   // The filtered view every surface reads — the filter applies plugin-wide by construction.
   property var tasks: []
@@ -79,6 +85,7 @@ Item {
     if (token === "") {
       root.status = "no-token"
       root.errorText = ""
+      root.cachedTasks = []
       root.allTasks = []
       root.tasks = []
       root.projects = []
@@ -143,7 +150,7 @@ Item {
     root.inFlight = true
     if (root.status !== "ready") root.status = "loading"   // a background poll keeps `ready`; the quiet gate below depends on it
     taskProc.startedAt = now.getTime()
-    root.runAuthedCurl(taskProc, Api.buildUrl("/v2/task", Api.todayQuery(now)))
+    root.runAuthedCurl(taskProc, Api.buildUrl("/v2/task", Api.taskQuery()))
   }
 
   // The whole request — token, verb, headers, body — goes to curl as a `-K -` config on
@@ -262,10 +269,12 @@ Item {
     return root.enqueueMutation("uncomplete", id, "")
   }
 
+  // Over the wide cache, not the narrow window: a task the overlay moves is usually one
+  // with no date, and looking it up in the window would find nothing and refuse the write.
   function taskById(id) {
-    for (var i = 0; i < root.allTasks.length; i++)
-      if (root.allTasks[i].id === id) return root.allTasks[i]
-    return undefined   // absent from the window: unknown shape, and mutationAllowed refuses
+    for (var i = 0; i < root.cachedTasks.length; i++)
+      if (root.cachedTasks[i].id === id) return root.cachedTasks[i]
+    return undefined   // absent from the cache: unknown shape, and mutationAllowed refuses
   }
 
   function complete(id) { return root.enqueueMutation("complete", id, "") }
@@ -302,11 +311,13 @@ Item {
         return
       }
       // The response is the task itself, so it goes through the same merge as a poll:
-      // isCurrent already drops a completed task, so the window needs no new filter. What
+      // isCached already drops a completed task, so the cache needs no new filter. What
       // the response does not carry — the recurrence rule — is carried across from the copy
       // we already hold, so a series cannot lose its protection by being renamed.
-      root.allTasks = Api.merge(root.allTasks,
-        [Api.carryRecurrence(root.taskById(task.id), task)], new Date())
+      var mutatedAt = new Date()
+      root.cachedTasks = Api.merge(root.cachedTasks,
+        [Api.carryRecurrence(root.taskById(task.id), task)], mutatedAt)
+      root.allTasks = Api.narrowWindow(root.allTasks, root.cachedTasks, mutatedAt)
       root.mutationError = ""
       if (mutationProc.op === "complete") {
         root.undoableId = task.id
@@ -360,9 +371,10 @@ Item {
       }
       if (incoming.length >= Api.MAX_COUNT)
         console.warn(root.pluginId + ": task list hit maxCount=" + Api.MAX_COUNT + ", the window may be truncated")
-      var next = Api.mergeFull(root.allTasks, incoming, now)
-      var quiet = next === root.allTasks && root.status === "ready" && root.errorText === ""
-      root.allTasks = next
+      var next = Api.mergeFull(root.cachedTasks, incoming)
+      var quiet = next === root.cachedTasks && root.status === "ready" && root.errorText === ""
+      root.cachedTasks = next
+      root.allTasks = Api.narrowWindow(root.allTasks, next, now)
       root.lastSync = now.toISOString()
       root.errorText = ""
       root.status = "ready"

@@ -2,8 +2,8 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   BASE_URL, MAX_COUNT, TASK_FIELDS,
-  endOfDay, startOfDay, todayQuery, projectsQuery, mergeFull,
-  buildUrl, parseTasks, parseProjects, merge, isCurrent,
+  endOfDay, startOfDay, taskQuery, projectsQuery, mergeFull,
+  buildUrl, parseTasks, parseProjects, merge, isCurrent, isCached, narrowWindow,
   isOverdue, normalizeExcluded, applyProjectFilter, countWindow,
   computeView, excludedList,
   sliceByTab, groupByProject, hiddenGroups, isCollapsed, flattenGroups,
@@ -31,10 +31,12 @@ const task = (over) => ({
 })
 const body = (tasks) => JSON.stringify({ tasks })
 
-test("todayQuery: unchecked, start.lte end of local day, no deadline filter, explicit maxCount", () => {
-  const q = todayQuery(now)
+test("taskQuery: unchecked, no window on start at all, no deadline filter, explicit maxCount", () => {
+  const q = taskQuery()
   assert.equal(q["checked.eq"], 0)
-  assert.match(q["start.lte"], /^2026-09-03T23:59:59[+-]\d\d:\d\d$/)
+  // Окна по start в запросе больше нет: склад — это задачи без даты, и фильтр их отсекал.
+  // Узкое окно осталось, но применяется на клиенте (narrowWindow).
+  assert.ok(!("start.lte" in q) && !("start.gte" in q))
   assert.equal(q.maxCount, MAX_COUNT)
   assert.equal(MAX_COUNT, 1000)
   assert.ok(!("deadline.lte" in q) && !("deadline.eq" in q))
@@ -47,10 +49,11 @@ test("projectsQuery asks only id and title", () => {
 })
 
 test("buildUrl encodes offsets and round-trips through URL", () => {
-  const url = buildUrl("/v2/task", todayQuery(now))
+  // Смещение кодируется в запросе проектов по дате — здесь проверяется сам приём.
+  const url = buildUrl("/v2/task", { ...taskQuery(), "start.lte": endOfDay(now) })
   assert.ok(url.startsWith(BASE_URL + "/v2/task?"))
   const parsed = new URL(url)
-  assert.equal(parsed.searchParams.get("start.lte"), todayQuery(now)["start.lte"])
+  assert.equal(parsed.searchParams.get("start.lte"), endOfDay(now))
   assert.equal(parsed.searchParams.get("checked.eq"), "0")
 })
 
@@ -95,11 +98,18 @@ test("merge: replace by id, drop checked/deleted", () => {
   assert.equal(renamed.find(t => t.id === "A").title, "renamed")
 })
 
-test("merge: today predicate on the client — tomorrow, deferred, no start leave the cache", () => {
+test("merge: предикат кэша на клиенте — уходят завершённая, отложенная и удалённая", () => {
+  // До SNG-4 эта проверка требовала обратного: перенос на завтра и снятие даты выбрасывали
+  // задачу из кэша. Так и было задумано, пока кэш обслуживал одну пилюлю, — но оверлей
+  // живёт ровно этими задачами, и после переноса карточка исчезала бы на глазах, изображая
+  // удаление. Окно «до конца сегодня» никуда не делось, оно теперь в narrowWindow.
   const cache = parseTasks(body([task({ id: "A" })]), now)
-  assert.deepEqual(merge(cache, parseTasks(body([task({ id: "A", start: tomorrow })]), now), now), [])
+  assert.deepEqual(merge(cache, parseTasks(body([task({ id: "A", start: tomorrow })]), now), now).map((t) => t.id),
+    ["A"], "перенос на завтра оставляет задачу в кэше")
+  assert.deepEqual(merge([], parseTasks(body([task({ id: "E", start: null })]), now), now).map((t) => t.id),
+    ["E"], "снятие даты — тоже")
   assert.deepEqual(merge([], parseTasks(body([task({ id: "D", deferred: true })]), now), now), [])
-  assert.deepEqual(merge([], parseTasks(body([task({ id: "E", start: null })]), now), now), [])
+  assert.deepEqual(merge([], parseTasks(body([task({ id: "C", checked: 1 })]), now), now), [])
   assert.equal(isCurrent(parseTasks(body([task({ id: "F", start: yesterday })]), now)[0], now), true)
 })
 
@@ -969,15 +979,84 @@ test("mergeFull не тащит из кэша то, чего нет в отве�
   assert.deepEqual(after.map((t) => t.id), ["B"])
 })
 
-test("mergeFull отсеивает по тому же окну, что и merge", () => {
+test("mergeFull отсеивает по тому же предикату кэша, что и merge", () => {
   const out = mergeFull([], parseTasks(body([
     task({ id: "A" }),
     task({ id: "B", checked: 1 }),
     task({ id: "C", deferred: true }),
     task({ id: "D", deleteDate: "2026-09-03" }),
     task({ id: "E", start: null })
-  ]), now), now)
-  assert.deepEqual(out.map((t) => t.id), ["A"], "завершённая, отложенная, удалённая и без начала — не окно")
+  ]), now))
+  // Задача без начала теперь ОСТАЁТСЯ: она и есть содержимое склада (SNG-4, R10). Уходят
+  // только завершённая, отложенная и удалённая.
+  assert.deepEqual(out.map((t) => t.id).sort(), ["A", "E"])
+})
+
+// --- Два окна: широкий кэш и узкое окно пилюли (SNG-4, U1) ---
+
+test("isCached держит задачу без начала, isCurrent — нет", () => {
+  const undated = parseTasks(body([task({ id: "U", start: null })]), now)[0]
+  assert.equal(isCached(undated), true, "склад — это задачи без даты, кэш обязан их держать")
+  assert.equal(isCurrent(undated, now), false, "в узкое окно она не входит, как и раньше")
+})
+
+test("завтрашняя задача лежит в кэше и не попадает в узкое окно", () => {
+  const t = parseTasks(body([task({ id: "T", start: tomorrow })]), now)[0]
+  assert.equal(isCached(t), true)
+  assert.equal(isCurrent(t, now), false, "завтра — не сегодня; пилюля его не считает")
+})
+
+test("завершённая, удалённая и отложенная не попадают ни в кэш, ни в узкое окно", () => {
+  for (const over of [{ checked: 1 }, { deleteDate: "2026-09-03" }, { deferred: true }]) {
+    const t = parseTasks(body([task({ id: "X", ...over })]), now)[0]
+    assert.equal(isCached(t), false, JSON.stringify(over))
+    assert.equal(isCurrent(t, now), false, JSON.stringify(over))
+  }
+})
+
+test("narrowWindow: пилюля считает ровно то же, что до расширения кэша", () => {
+  // Регрессия, ради которой юнит идёт первым. Слева — то, что теперь лежит в кэше; справа —
+  // то, что обязана увидеть пилюля: прежнее правило «всё до конца сегодня», ни строкой
+  // больше. AE2 требует, чтобы перенос задачи на завтра счётчик не трогал.
+  const cache = mergeFull([], parseTasks(body([
+    task({ id: "A", start: yesterday }),
+    task({ id: "B", start: today }),
+    task({ id: "C", start: tomorrow }),
+    task({ id: "D", start: null }),
+    task({ id: "E", start: iso(2026, 8, 20) })
+  ]), now))
+  assert.equal(cache.length, 5, "в кэше все пять")
+  const window = narrowWindow(null, cache, now)
+  assert.deepEqual(window.map((t) => t.id).sort(), ["A", "B"],
+    "в окне только просроченная и сегодняшняя — как считал прежний фильтр")
+  assert.equal(countWindow(window, now).total, 2)
+})
+
+test("narrowWindow возвращает прежнюю ссылку, когда окно не сдвинулось", () => {
+  const cache = mergeFull([], parseTasks(body([task({ id: "A" }), task({ id: "D", start: null })]), now))
+  const first = narrowWindow(null, cache, now)
+  assert.equal(narrowWindow(first, cache, now), first, "тот же набор — та же ссылка")
+  const wider = mergeFull(cache, parseTasks(body([
+    task({ id: "A" }), task({ id: "D", start: null }), task({ id: "B", start: today })
+  ]), now))
+  assert.notEqual(narrowWindow(first, wider, now), first, "в окне прибыло — новый массив")
+})
+
+test("narrowWindow отдаёт сам кэш, когда в нём нечего сужать", () => {
+  // Ленивая ветка: если ни одна задача не выпадает, второй массив не нужен вовсе.
+  const cache = mergeFull([], parseTasks(body([task({ id: "A" }), task({ id: "B", start: yesterday })]), now))
+  assert.equal(narrowWindow(null, cache, now), cache)
+})
+
+test("задачи без начала сортируются последними и не меняются местами между опросами", () => {
+  // `null < "2026-…"` и обратное — оба false, поэтому без явного правила порядок достался бы
+  // от того, как ответил сервер, и строки прыгали бы между опросами.
+  const order = (first, second) => mergeFull([], parseTasks(body([
+    task({ id: first, title: "aaa", start: first === "U" ? null : today }),
+    task({ id: second, title: "bbb", start: second === "U" ? null : today })
+  ]), now)).map((t) => t.id)
+  assert.deepEqual(order("U", "D"), ["D", "U"], "датированная впереди")
+  assert.deepEqual(order("D", "U"), ["D", "U"], "порядок ответа на результат не влияет")
 })
 
 test("shouldFetchProjects: раз в сутки и по требованию", () => {
