@@ -13,6 +13,7 @@ import {
   parseNote, taskFields, recurrenceState, taskWebUrl, WEB_BASE,
   resolveActionKey, mutationAllowed, shouldDeferPoll, shouldFetchProjects, isStalePollResponse, mutationBody,
   carryRecurrence,
+  zoneOf, storeGroups, overlayView, OVERLAY_ZONES,
   MUTATIONS, escapeCurlConfigValue, buildCurlConfig, buildRequestCommand,
   buildCreateBody, buildRenameBody, parseTask
 } from "../Api.mjs"
@@ -1092,4 +1093,91 @@ test("mergeFull с пустым ответом опустошает окно", (
   // Путь, стирающий весь список: если сервер вернул пустое окно, значит окно и правда пусто.
   const cache = mergeFull([], parseTasks(body([task({ id: "A" })]), now), now)
   assert.deepEqual(mergeFull(cache, parseTasks(body([]), now), now), [])
+})
+
+
+// --- Оверлей: четыре зоны (SNG-4, U3) ---
+
+const proj = [{ id: "P-1", title: "Contour" }, { id: "P-2", title: "Invoices" }]
+
+test("zoneOf: задача без начала — склад, а не просрочено", () => {
+  // Главная ловушка раскладки: 188 задач из 192 не имеют даты, и правило «раньше сегодня»
+  // объявило бы их все просроченными.
+  assert.equal(zoneOf({ start: null }, now), "store")
+  assert.equal(zoneOf({ start: "" }, now), "store")
+})
+
+test("zoneOf: вчера, сегодня, завтра, послезавтра", () => {
+  assert.equal(zoneOf({ start: yesterday }, now), "overdue")
+  assert.equal(zoneOf({ start: today }, now), "today")
+  assert.equal(zoneOf({ start: tomorrow }, now), "tomorrow")
+  assert.equal(zoneOf({ start: iso(2026, 8, 5) }, now), "later", "послезавтра — ни в одну зону оверлея")
+})
+
+test("zoneOf: границы суток", () => {
+  assert.equal(zoneOf({ start: new Date(2026, 8, 3, 0, 0, 0).toISOString() }, now), "today",
+    "ровно полночь сегодня — сегодня, а не просрочено")
+  assert.equal(zoneOf({ start: new Date(2026, 8, 3, 23, 59, 59).toISOString() }, now), "today")
+  assert.equal(zoneOf({ start: new Date(2026, 8, 4, 23, 59, 59).toISOString() }, now), "tomorrow",
+    "завтра в 23:59 — ещё завтра, а не мимо зон")
+  assert.equal(zoneOf({ start: new Date(2026, 8, 5, 0, 0, 0).toISOString() }, now), "later")
+})
+
+test("storeGroups: порядок по числу задач, крупные первыми", () => {
+  const tasks = [
+    task({ id: "a1", projectId: "P-2", start: null }),
+    task({ id: "b1", projectId: "P-1", start: null }),
+    task({ id: "b2", projectId: "P-1", start: null }),
+    task({ id: "b3", projectId: "P-1", start: null })
+  ]
+  const groups = storeGroups(null, tasks, proj)
+  assert.deepEqual(groups.map((g) => g.count), [3, 1], "стопка на три впереди стопки на одну")
+  assert.equal(groups[0].key, "P-1")
+})
+
+test("storeGroups: задача без проекта — отдельной группой, не потеряна", () => {
+  const groups = storeGroups(null, [
+    task({ id: "x", projectId: null, start: null }),
+    task({ id: "y", projectId: "P-1", start: null })
+  ], proj)
+  assert.equal(groups.length, 2)
+  assert.equal(groups.reduce((n, g) => n + g.count, 0), 2, "ни одна задача не пропала")
+})
+
+test("overlayView раскладывает кэш по четырём зонам", () => {
+  const tasks = [
+    task({ id: "A", start: yesterday }),
+    task({ id: "B", start: today }),
+    task({ id: "C", start: tomorrow }),
+    task({ id: "D", start: null }),
+    task({ id: "E", start: null, projectId: "P-2" }),
+    task({ id: "F", start: iso(2026, 8, 20) })
+  ]
+  const view = overlayView(null, { tasks, projects: proj, now })
+  assert.deepEqual(view.counts, { store: 2, overdue: 1, today: 1, tomorrow: 1 })
+  assert.deepEqual(view.overdue.map((t) => t.id), ["A"])
+  assert.deepEqual(view.today.map((t) => t.id), ["B"])
+  assert.deepEqual(view.tomorrow.map((t) => t.id), ["C"])
+  assert.equal(view.store.length, 2, "две стопки: два проекта")
+  assert.deepEqual(OVERLAY_ZONES, ["store", "overdue", "today", "tomorrow"])
+})
+
+test("overlayView возвращает ту же ссылку, когда ничего не сдвинулось", () => {
+  // Тихий гейт. Без него опрос раз в десять минут перестраивал бы оверлей целиком — вместе
+  // с положением курсора и начатым перетаскиванием.
+  const tasks = [task({ id: "A", start: today }), task({ id: "D", start: null })]
+  const first = overlayView(null, { tasks, projects: proj, now })
+  assert.equal(overlayView(first, { tasks, projects: proj, now }), first, "те же данные — та же ссылка")
+  const moved = [tasks[0], { ...tasks[1], start: today }]
+  assert.notEqual(overlayView(first, { tasks: moved, projects: proj, now }), first,
+    "задача переехала в другую зону — новый объект")
+})
+
+test("overlayView пересобирается на новых сутках при том же наборе задач", () => {
+  // Полночь меняет зоны, не трогая данные: вчерашняя «сегодня» становится просроченной.
+  const tasks = [task({ id: "A", start: today })]
+  const first = overlayView(null, { tasks, projects: proj, now })
+  const nextDay = overlayView(first, { tasks, projects: proj, now: new Date(2026, 8, 4, 12) })
+  assert.notEqual(nextDay, first)
+  assert.deepEqual(nextDay.overdue.map((t) => t.id), ["A"], "та же задача, другая зона")
 })

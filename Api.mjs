@@ -804,3 +804,84 @@ export function carryRecurrence(prev, next) {
   out.recurrence = prev.recurrence
   return out
 }
+
+// --- Overlay: four zones (SNG-4) ---
+//
+// Which zone a task lands in is decided here for the reason AGENTS.md gives: the mistake is
+// silent. A task in the wrong column looks like a task, and nobody notices until they count
+// by hand. QML gets one property and one assignment, as with popupView.
+
+export const OVERLAY_ZONES = ["store", "overdue", "today", "tomorrow"]
+
+// Tomorrow by the calendar, not by adding 86_400_000. Across a daylight-saving change the
+// arithmetic version lands an hour off and quietly files a task under the neighbouring zone.
+// This machine's zone does not shift, but the plugin is not only for this machine.
+function tomorrowRange(now) {
+  const from = startOfDay(now)
+  from.setDate(from.getDate() + 1)
+  return { from, to: endOfDayDate(from) }
+}
+
+// "later" is a real answer, not a leftover: a task starting the day after tomorrow is in the
+// cache and belongs to no zone the overlay draws. Naming it keeps that a decision.
+export function zoneOf(task, now) {
+  if (!task.start) return "store"
+  const at = new Date(task.start).getTime()
+  if (at < startOfDay(now).getTime()) return "overdue"
+  if (at <= endOfDayDate(now).getTime()) return "today"
+  return at <= tomorrowRange(now).to.getTime() ? "tomorrow" : "later"
+}
+
+// The store is ordered by how many tasks a project holds, largest first — the opposite of
+// the popup, which orders by title. Twenty-one stacks read as a heap unless the big ones
+// come first, and the big ones are where the sorting actually happens (50, 49, 25 tasks
+// against a tail of ones). groupByProject builds the groups; only the order differs, so it
+// is reused rather than reimplemented.
+const byCountThenTitle = (a, b) => b.count - a.count || compareGroups(a, b)
+
+export function storeGroups(prev, tasks, projects) {
+  const groups = [...groupByProject([], tasks, projects)].sort(byCountThenTitle)
+  return sameGroups(prev, groups) ? prev : groups
+}
+
+// Element identity: both arrays hold the objects the cache put there, and a quiet poll hands
+// the same ones back.
+function sameList(a, b) {
+  return Array.isArray(a) && a.length === b.length && a.every((t, i) => t === b[i])
+}
+
+// The one entry point QML calls, holding its own previous references — same shape as
+// popupView, and for the same reason: a fresh array on every poll would rebuild the whole
+// overlay ten times an hour, dropping the cursor and any half-finished drag.
+export function overlayView(prev, args) {
+  const { tasks, projects, now } = args
+  const previous = prev || {}
+  const zones = { store: [], overdue: [], today: [], tomorrow: [] }
+  for (const t of tasks) {
+    const zone = zoneOf(t, now)
+    if (zones[zone]) zones[zone].push(t)
+  }
+  const store = storeGroups(previous.store, zones.store, projects)
+  const overdue = sameList(previous.overdue, zones.overdue) ? previous.overdue : zones.overdue
+  const today = sameList(previous.today, zones.today) ? previous.today : zones.today
+  const tomorrow = sameList(previous.tomorrow, zones.tomorrow) ? previous.tomorrow : zones.tomorrow
+  // The day is part of the comparison, as in popupView: an unchanged task set still changes
+  // zones once midnight passes, and a stale `now` would freeze yesterday's columns.
+  if (prev && prev.store === store && prev.overdue === overdue && prev.today === today
+      && prev.tomorrow === tomorrow
+      && startOfDay(prev.now).getTime() === startOfDay(now).getTime()) return prev
+  return {
+    now,
+    store,
+    overdue,
+    today,
+    tomorrow,
+    storeCount: zones.store.length,
+    counts: {
+      store: zones.store.length,
+      overdue: zones.overdue.length,
+      today: zones.today.length,
+      tomorrow: zones.tomorrow.length
+    }
+  }
+}
