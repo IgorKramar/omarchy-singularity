@@ -47,6 +47,10 @@ Item {
   // any project names have arrived, and the `refresh` IPC command each raise it.
   property bool projectsFetchPending: false
   property string lastProjectFetchDay: ""
+  // The token the in-flight project request was issued under, for the same reason the write
+  // path remembers its own: a list that comes back after the token changed describes another
+  // account, and merging it would put foreign project names in this session's cache.
+  property string issuedProjectToken: ""
 
   function dayKey(date) {
     return date.getFullYear() + "-" + (date.getMonth() + 1) + "-" + date.getDate()
@@ -366,9 +370,17 @@ Item {
       if (!quiet || visibleChanged) root.changed()
       // Projects are asked for once a local day, or whenever something raised the flag.
       // Tasks no longer decide this: they are fetched whole every time.
-      if (root.projectsFetchPending || root.lastProjectFetchDay !== root.dayKey(now)) {
-        projectProc.forDay = root.dayKey(new Date(taskProc.startedAt))   // the day the request was built for
-        root.projectsFetchPending = false
+      //
+      // One day value for both the question and the answer: the poll started at
+      // `taskProc.startedAt`, and asking with one day while recording another would let a
+      // request that straddles midnight claim the wrong day.
+      var startDay = root.dayKey(new Date(taskProc.startedAt))
+      if (Api.shouldFetchProjects(root.projectsFetchPending, root.lastProjectFetchDay, startDay)) {
+        // The flag is not cleared here. It is the only carrier of "someone asked out of
+        // turn", and a request that fails would take that request with it — the names would
+        // then wait for tomorrow, which is the very thing this flag exists to prevent.
+        projectProc.forDay = startDay
+        root.issuedProjectToken = root.apiToken
         root.runAuthedCurl(projectProc, Api.buildUrl("/v2/project", Api.projectsQuery()))
       } else {
         root.inFlight = false
@@ -387,7 +399,7 @@ Item {
     stdout: StdioCollector { id: projectOut; waitForEnd: true }
     stderr: StdioCollector { id: projectErr; waitForEnd: true }
     onExited: function(exitCode) {
-      if (root.apiToken === "") {
+      if (root.apiToken !== root.issuedProjectToken) {   // answer from another account
         root.inFlight = false
         root.refreshPending = false
         return
@@ -398,7 +410,11 @@ Item {
       } else {
         try {
           root.projects = Api.parseProjects(projectOut.text)
+          // Both marks of success, written together and only here: the day is claimed and
+          // the out-of-turn request is answered. A failure leaves both as they were, so the
+          // next poll asks again instead of waiting for tomorrow.
           root.lastProjectFetchDay = projectProc.forDay
+          root.projectsFetchPending = false
         } catch (e) {
           root.errorText = "projects: " + String(e.message || e)
         }

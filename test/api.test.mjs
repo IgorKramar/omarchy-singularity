@@ -11,7 +11,7 @@ import {
   errorClass, unmatchedExcluded, emptyReason,
   toggleKey, isStale, priorityLabel, footerState,
   parseNote, taskFields, recurrenceState, taskWebUrl, WEB_BASE,
-  resolveActionKey, mutationAllowed, shouldDeferPoll, isStalePollResponse, mutationBody,
+  resolveActionKey, mutationAllowed, shouldDeferPoll, shouldFetchProjects, isStalePollResponse, mutationBody,
   carryRecurrence,
   MUTATIONS, escapeCurlConfigValue, buildCurlConfig, buildRequestCommand,
   buildCreateBody, buildRenameBody, parseTask
@@ -975,4 +975,39 @@ test("mergeFull отсеивает по тому же окну, что и merge"
     task({ id: "E", start: null })
   ]), now), now)
   assert.deepEqual(out.map((t) => t.id), ["A"], "завершённая, отложенная, удалённая и без начала — не окно")
+})
+
+test("shouldFetchProjects: раз в сутки и по требованию", () => {
+  assert.equal(shouldFetchProjects(false, "2026-09-07", "2026-09-07"), false,
+    "тот же день и никто не просил — проекты не трогаем")
+  assert.equal(shouldFetchProjects(false, "2026-09-06", "2026-09-07"), true, "новый день")
+  assert.equal(shouldFetchProjects(true, "2026-09-07", "2026-09-07"), true,
+    "попросили: сменился токен, задан отсев до прихода имён, или ручное обновление")
+  assert.equal(shouldFetchProjects(false, "", "2026-09-07"), true, "имён ещё не было ни разу")
+})
+
+test("isCurrent не смотрит на поле removed, даже если оно пришло", () => {
+  // Поле запросить нельзя (400), но чужой источник данных мог бы его принести. Раньше
+  // проверка на него стояла в isCurrent и не срабатывала никогда; тест закрепляет, что её
+  // удаление — решение, а не потеря: задача остаётся в окне.
+  const out = parseTasks(body([task({ id: "X", removed: true })]), now)
+  assert.equal(isCurrent(out[0], now), true)
+})
+
+test("порядок при равных начале и названии не зависит от порядка ответа", () => {
+  // merge раньше получал устойчивость даром — из Map поверх кэша. Опрос строит набор из
+  // ответа, поэтому порядок пришлось закрепить явно: иначе одинаковые строки менялись бы
+  // местами между опросами, а это читается как сбой.
+  const pair = (first, second) => mergeFull([], parseTasks(body([
+    task({ id: first, title: "одно и то же", start: iso(2026, 8, 3) }),
+    task({ id: second, title: "одно и то же", start: iso(2026, 8, 3) })
+  ]), now), now).map((t) => t.id)
+  assert.deepEqual(pair("B", "A"), ["A", "B"])
+  assert.deepEqual(pair("A", "B"), ["A", "B"], "порядок ответа на результат не влияет")
+})
+
+test("mergeFull с пустым ответом опустошает окно", () => {
+  // Путь, стирающий весь список: если сервер вернул пустое окно, значит окно и правда пусто.
+  const cache = mergeFull([], parseTasks(body([task({ id: "A" })]), now), now)
+  assert.deepEqual(mergeFull(cache, parseTasks(body([]), now), now), [])
 })
