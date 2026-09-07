@@ -953,9 +953,12 @@ test("mergeFull возвращает ту же ссылку, когда окно
   const first = mergeFull([], answer(), now)
   assert.deepEqual(first.map((t) => t.id), ["A", "B"])
   assert.equal(mergeFull(first, answer(), now), first, "то же содержимое — та же ссылка")
-  const changed = mergeFull(first, parseTasks(body([task({ id: "A", title: "иначе" }), task({ id: "B" })]), now), now)
+  const changed = mergeFull(first, parseTasks(body([task({ id: "A", title: "renamed" }), task({ id: "B" })]), now), now)
   assert.notEqual(changed, first, "изменилось название — новый массив")
-  assert.equal(changed[0].title, "иначе")
+  // По id, а не по позиции: порядок при равном начале решает localeCompare, а он зависит от
+  // локали среды — на этой машине одна, на раннере другая. Для плагина так и надо (порядок
+  // по локали пользователя), но тест на неё опираться не должен.
+  assert.equal(changed.find((t) => t.id === "A").title, "renamed")
 })
 
 test("mergeFull не тащит из кэша то, чего нет в ответе", () => {
