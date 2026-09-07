@@ -653,6 +653,9 @@ export const MUTATIONS = {
   // popup — which is exactly how it was found.
   uncomplete: (id) => ({ method: "POST", path: "/v2/task/" + encodeURIComponent(id) + "/uncomplete" }),
   rename: (id) => ({ method: "PATCH", path: "/v2/task/" + encodeURIComponent(id) }),
+  // The date lives on the task, so moving a card is a PATCH like a rename — not
+  // `/v2/task/{id}/move`, which despite the name moves a task between *projects*.
+  move: (id) => ({ method: "PATCH", path: "/v2/task/" + encodeURIComponent(id) }),
   create: () => ({ method: "POST", path: "/v2/task" })
 }
 
@@ -693,14 +696,27 @@ export function buildRequestCommand(url) {
 // carries it). Sending no `projectId` is therefore the whole of it.
 const cleanTitle = (v) => String(v == null ? "" : v).trim()
 
+// Morning of a local day, written the way endOfDay writes its own timestamp: the API
+// normalises the offset to UTC, so the offset must be the local one, not a hardcoded Z.
+export function morningOf(day) {
+  return `${day.getFullYear()}-${pad(day.getMonth() + 1)}-${pad(day.getDate())}T09:00:00${localOffset(day)}`
+}
+
 export function buildCreateBody(title, now) {
   const clean = cleanTitle(title)
   if (clean === "") return null
-  // Morning of the local day, written the way endOfDay writes its own timestamp: the API
-  // normalises the offset to UTC, so the offset must be the local one, not a hardcoded Z.
-  const d = startOfDay(now)
-  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T09:00:00${localOffset(d)}`
-  return { title: clean, start: stamp }
+  return { title: clean, start: morningOf(startOfDay(now)) }
+}
+
+// Moving a card to a zone: the target zone in, the new `start` out. Both directions are
+// here, including the one that clears the date, because that is the asymmetric case —
+// `{start: null}` is a body, `null` is a refusal, and the queue drops a refusal in silence.
+export function buildMoveBody(zone, now) {
+  if (zone === "store") return { start: null }
+  const day = startOfDay(now)
+  if (zone === "tomorrow") day.setDate(day.getDate() + 1)
+  else if (zone !== "today") return null   // "overdue" and "later" are not destinations
+  return { start: morningOf(day) }
 }
 
 export function buildRenameBody(title) {
@@ -739,6 +755,19 @@ export function resolveActionKey(text) {
   return ACTION_KEYS[text] || ""
 }
 
+// Digits, not letters, and the reason is the shell's own key catcher: it resolves h/j/k/l as
+// arrows, x as delete and Space as activate before `textKey` ever fires, so a letter bound
+// here would either never arrive or steal a movement. Digits carry no layout either — the
+// Russian layout puts the same digits in the same places, so no Cyrillic twins are needed
+// (unlike ACTION_KEYS above, where they are).
+//
+// "Overdue" is not a destination: nothing is moved into the past.
+const ZONE_KEYS = { "1": "today", "2": "tomorrow", "0": "store" }
+
+export function resolveZoneKey(text) {
+  return ZONE_KEYS[text] || ""
+}
+
 // May this write be sent at all? Asked at the service boundary rather than in the panel,
 // because the panel is not the only caller: the IPC handler reaches the same POST, and a
 // guard that lives in one caller is not a guard.
@@ -748,7 +777,10 @@ export function resolveActionKey(text) {
 // resolves to "unknown" and is refused by construction: declining costs a keystroke,
 // guessing costs a series.
 export function mutationAllowed(op, task) {
-  if (op !== "complete") return true
+  // A recurring task is a generator plus the instances it makes. Completing one is not
+  // something this API offers, and moving one rewrites the schedule instead of the card the
+  // user grabbed — both damage the series quietly, so both are refused the same way.
+  if (op !== "complete" && op !== "move") return true
   return recurrenceState(task) === "none"
 }
 
@@ -783,10 +815,13 @@ export function isStalePollResponse(startedAt, lastMutationAt) {
 //
 // `complete` has no body and is still valid; a blank title is invalid and has none. Those
 // are different facts, so they do not share the `null` return that once carried both.
+// `title` is whatever the operation carries: a title for create/rename, a target zone for
+// move. The queue entry has one payload field and the operation says how to read it.
 export function mutationBody(op, title, now) {
   if (op === "complete" || op === "uncomplete") return { ok: true, body: null }
   const body = op === "create" ? buildCreateBody(title, now)
-    : op === "rename" ? buildRenameBody(title) : undefined
+    : op === "rename" ? buildRenameBody(title)
+    : op === "move" ? buildMoveBody(title, now) : undefined
   if (body === undefined) throw new Error("unknown mutation: " + op)
   return body === null ? { ok: false, body: null } : { ok: true, body: body }
 }

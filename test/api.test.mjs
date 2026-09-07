@@ -14,6 +14,7 @@ import {
   resolveActionKey, mutationAllowed, shouldDeferPoll, shouldFetchProjects, isStalePollResponse, mutationBody,
   carryRecurrence,
   zoneOf, storeGroups, overlayView, OVERLAY_ZONES,
+  resolveZoneKey, buildMoveBody, morningOf,
   MUTATIONS, escapeCurlConfigValue, buildCurlConfig, buildRequestCommand,
   buildCreateBody, buildRenameBody, parseTask
 } from "../Api.mjs"
@@ -1180,4 +1181,87 @@ test("overlayView пересобирается на новых сутках пр
   const nextDay = overlayView(first, { tasks, projects: proj, now: new Date(2026, 8, 4, 12) })
   assert.notEqual(nextDay, first)
   assert.deepEqual(nextDay.overdue.map((t) => t.id), ["A"], "та же задача, другая зона")
+})
+
+
+// --- Оверлей: перенос (SNG-4, U6) ---
+
+test("resolveZoneKey: цифры дают зоны, прочее — ничего", () => {
+  assert.equal(resolveZoneKey("1"), "today")
+  assert.equal(resolveZoneKey("2"), "tomorrow")
+  assert.equal(resolveZoneKey("0"), "store")
+  for (const key of ["3", "9", "l", "h", "x", " ", "", "щ"]) assert.equal(resolveZoneKey(key), "")
+})
+
+test("resolveZoneKey не пересекается с командами попапа", () => {
+  // Буквы разбираются перехватчиком оболочки раньше textKey, поэтому зоны на цифрах. Проверка
+  // держит это свойство: ни одна клавиша не значит двух вещей.
+  for (const key of ["1", "2", "0"]) assert.equal(resolveActionKey(key), "", key)
+})
+
+test("buildMoveBody: сегодня и завтра — утро дня, склад — снятие даты", () => {
+  assert.deepEqual(buildMoveBody("today", now), { start: morningOf(new Date(2026, 8, 3)) })
+  assert.deepEqual(buildMoveBody("tomorrow", now), { start: morningOf(new Date(2026, 8, 4)) })
+  assert.match(buildMoveBody("today", now).start, /^2026-09-03T09:00:00[+-]\d\d:\d\d$/)
+  assert.match(buildMoveBody("tomorrow", now).start, /^2026-09-04T09:00:00[+-]\d\d:\d\d$/)
+})
+
+test("buildMoveBody: снятие даты — это {start: null}, а не пустое тело", () => {
+  // Пустое тело очередь отвергает молча (mutationBody отдаёт ok:false), и снятие даты просто
+  // не отправлялось бы. Разница между «поле со значением null» и «поля нет» здесь решающая.
+  const body = buildMoveBody("store", now)
+  assert.deepEqual(body, { start: null })
+  assert.ok("start" in body)
+  assert.equal(mutationBody("move", "store", now).ok, true, "тело есть — запись уходит")
+})
+
+test("buildMoveBody: в прошлое и в никуда не переносят", () => {
+  assert.equal(buildMoveBody("overdue", now), null)
+  assert.equal(buildMoveBody("later", now), null)
+  assert.equal(mutationBody("move", "overdue", now).ok, false, "очередь такую запись не примет")
+})
+
+test("перенос завтра считается календарно и переживает конец месяца", () => {
+  const lastDay = new Date(2026, 8, 30, 12)
+  assert.match(buildMoveBody("tomorrow", lastDay).start, /^2026-10-01T09:00:00/)
+})
+
+test("каждая операция заведена в обеих таблицах", () => {
+  // Забытая ветка в mutationBody роняет исключение прямо в сеттере QML: Service.qml зовёт её
+  // без защиты. Тест проходит по MUTATIONS и требует тела для каждой.
+  for (const op of Object.keys(MUTATIONS)) {
+    assert.doesNotThrow(() => mutationBody(op, "today", now), `нет тела для "${op}"`)
+    assert.equal(typeof MUTATIONS[op]("T-1").path, "string")
+  }
+  assert.throws(() => mutationBody("teleport", "x", now), /unknown mutation/)
+})
+
+test("перенос повторяющейся задачи отклоняется, как и её отметка", () => {
+  const plain = { recurrence: null, recurrenceGeneratorId: "" }
+  const instance = { recurrence: null, recurrenceGeneratorId: "T-gen" }
+  const generator = { recurrence: { freq: "daily" }, recurrenceGeneratorId: "" }
+  assert.equal(mutationAllowed("move", plain), true)
+  assert.equal(mutationAllowed("move", instance), false, "перенос экземпляра переписал бы серию")
+  assert.equal(mutationAllowed("move", generator), false, "генератор тем более")
+  assert.equal(mutationAllowed("move", undefined), false, "задачи нет в кэше — форма неизвестна")
+  assert.equal(mutationAllowed("rename", generator), true, "переименование серии по-прежнему можно")
+})
+
+test("AE3/AE4: перенос на сегодня и обратно возвращает исходное состояние", () => {
+  const undated = parseTasks(body([task({ id: "D", start: null })]), now)[0]
+  assert.equal(zoneOf(undated, now), "store")
+  const moved = { ...undated, start: buildMoveBody("today", now).start }
+  assert.equal(zoneOf(moved, now), "today", "ушла в сегодня")
+  assert.equal(isCurrent(moved, now), true, "и попала в окно пилюли — счётчик вырастет")
+  const back = { ...moved, start: buildMoveBody("store", now).start }
+  assert.equal(zoneOf(back, now), "store", "вернулась на склад")
+  assert.equal(isCurrent(back, now), false, "и вышла из окна пилюли")
+})
+
+test("AE2: перенос на завтра счётчик пилюли не трогает", () => {
+  const undated = parseTasks(body([task({ id: "D", start: null })]), now)[0]
+  const moved = { ...undated, start: buildMoveBody("tomorrow", now).start }
+  assert.equal(zoneOf(moved, now), "tomorrow")
+  assert.equal(isCurrent(moved, now), false, "завтра в окно не входит — число на пилюле прежнее")
+  assert.equal(isCached(moved), true, "но из кэша не исчезает: карточка остаётся на экране")
 })
