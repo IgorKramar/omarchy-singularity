@@ -63,6 +63,11 @@ Item {
 
   readonly property bool completable: root.checkState === "none"
 
+  // Where the title starts. Published so the expansion below can line up with it by
+  // reference: reproducing the three numbers there would misalign silently the day the
+  // checkbox or the row margin changes, and nothing in QML would fail to say so.
+  readonly property real titleInset: line.anchors.leftMargin + box.width + line.spacing
+
   Row {
     id: line
     anchors.left: parent.left
@@ -157,20 +162,34 @@ Item {
         id: renameField
         anchors.verticalCenter: parent.verticalCenter
         width: parent.width
+        // Above the row-wide MouseArea, which swallows every click on purpose. Without
+        // this, clicking into the field to place the caret would land on the row instead.
+        // It receives nothing while invisible, so an ordinary row click is unaffected.
+        z: 1
         visible: root.renaming
-        enabled: !root.renameSending
-        onAccepted: root.renameAccepted(text)
+        // readOnly, never `enabled: false`: disabling a focused field takes its focus away,
+        // and the panel raises `blocked` for the whole time a rename is open. The popup
+        // would then have the keyboard captured with nothing to type into — every key
+        // swallowed, no way out but the mouse.
+        readOnly: root.renameSending
+        onAccepted: if (!root.renameSending) root.renameAccepted(text)
         // TextField carries no Escape handling of its own, and while the catcher is
         // blocked it only passes the key through — without this the user would be shut
         // inside the field with no way back to the list.
         Keys.onEscapePressed: root.renameCancelled()
 
-        onVisibleChanged: {
+        // Also on creation: a list rebuild while the rename is open destroys this delegate
+        // and builds a new one already visible, so onVisibleChanged never fires and the
+        // field would come back empty and unfocused.
+        function begin() {
           if (!visible) return
           text = root.task ? root.task.title : ""
           forceActiveFocus()
           selectAll()
         }
+
+        onVisibleChanged: begin()
+        Component.onCompleted: begin()
       }
     }
 

@@ -19,7 +19,7 @@ Column {
 
   readonly property color dim: Qt.darker(foreground, 1.6)
   readonly property var note: Api.parseNote(root.task ? root.task.note : "")
-  readonly property var fields: Api.taskFields(root.task, new Date())
+  readonly property var fields: Api.taskFields(root.task)
   readonly property var web: Api.taskWebUrl(root.task)
 
   // Qt.locale, not the engine's toLocaleDateString with Intl options: the latter silently
@@ -34,7 +34,8 @@ Column {
   spacing: Style.space(6)
   topPadding: Style.space(2)
   bottomPadding: Style.space(8)
-  leftPadding: Style.space(10) + Style.space(13) + Style.space(8)   // under the title, past the checkbox
+  // Set by the caller from the row's own metric, so the two cannot drift apart.
+  leftPadding: Style.space(10)
   rightPadding: Style.space(10)
 
   // The note is the reason to open a task at all, so it comes first and whole — no elide,

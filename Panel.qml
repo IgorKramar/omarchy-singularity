@@ -113,13 +113,14 @@ Panel {
   function checkStateFor(task) {
     if (!root.svc) return "unknown"
     if (root.svc.pendingIds.indexOf(task.id) !== -1) return "pending"
-    var r = Api.recurrenceState(task)
-    return r === "none" ? "none" : r
+    return Api.recurrenceState(task)
   }
 
   function completeTask(task) {
     if (!root.svc || !task) return
-    if (Api.recurrenceState(task) !== "none") return
+    // The recurrence refusal lives in the service now, where the IPC path meets it too.
+    // The row still draws a repeat glyph instead of a checkbox, so this is not the user's
+    // first notice — it is the last line, not the only one.
     root.svc.complete(task.id)
   }
 
@@ -142,26 +143,36 @@ Panel {
   function startRename(task) {
     if (!task || !root.svc) return
     root.expandedId = ""
+    root.renameRefused = false
     root.renamingId = task.id
   }
 
   function cancelRename() {
     root.renamingId = ""
+    root.renameRefused = false
     keyCatcher.forceActiveFocus()
   }
 
+  // The field is never closed on submit: it closes on `mutated`, so a rename that failed
+  // leaves the text where the user can see and retry it. A refusal at the door — no token,
+  // a write already in flight for this task — is reported the same way and also keeps it.
   function commitRename(task, title) {
-    if (!root.svc || !task) return
-    // The field is not closed here: it closes on `mutated`, so a rename that failed leaves
-    // the text where the user can see and retry it rather than silently reverting.
-    if (!root.svc.rename(task.id, title)) root.cancelRename()
+    if (!root.svc || !task || root.renameSending) return
+    if (!root.svc.rename(task.id, title)) root.renameRefused = true
   }
 
   function submitAdd() {
-    if (!root.svc) return
+    if (!root.svc || root.addSending) return
     if (root.addDraft.trim() === "") return
     root.svc.add(root.addDraft)
   }
+
+  readonly property bool renameSending: root.svc && root.renamingId !== ""
+    && root.svc.pendingIds.indexOf(root.renamingId) !== -1
+  // Set when the service turned a rename away without sending it; cleared the moment the
+  // user touches the field again, so it reports this attempt and not the previous one.
+  property bool renameRefused: false
+  property double lastKeyCompleteAt: 0
 
   // Only a confirmed write clears the field or closes the editor. Doing it on submit
   // would throw away the text on the one path where the user still needs it.
@@ -214,6 +225,12 @@ Panel {
     // Named whether or not the list is empty. A failed poll on top of a cache that still
     // has rows is the likeliest failure there is, and without this line the popup shows the
     // stale list beside the time of the last *successful* sync — a screen that looks right.
+    // First, because it is the only line that says what can still be done about what just
+    // happened. A completed task is out of the window the moment the answer lands, and the
+    // next poll is up to ten minutes away.
+    if (root.svc && root.svc.undoableId !== "")
+      parts.push("Отмечено: " + root.svc.undoableTitle + " · u — вернуть")
+    if (root.renameRefused) parts.push("Переименование не отправлено: по этой задаче уже идёт запись")
     if (root.mutationPhrase !== "") parts.push(root.mutationPhrase)
     if (root.svcStatus === "error") parts.push(root.errorPhrase)
     if (root.updating) parts.push("обновляется")
@@ -247,6 +264,13 @@ Panel {
   }
 
   onViewChanged: {
+    // A rename whose row left the list would keep `blocked` raised with nothing focusable:
+    // every key would then vanish and the popup could only be closed with the mouse. The
+    // row can go for reasons the field never sees — a tab switch, a collapsed section, a
+    // poll that dropped the task.
+    if (root.renamingId !== ""
+        && Api.cursorIndexForId(root.view.flat, "task:" + root.renamingId, -1, null) < 0)
+      root.cancelRename()
     if (!root.cursorActive) return
     root.cursorIndex = Api.cursorIndexForId(root.view.flat, root.cursorId,
                                             root.cursorIndex, root.cursorSection)
@@ -381,20 +405,17 @@ Panel {
 
       onCloseRequested: root.close()
       // Letters the catcher does not spend itself: j/k/h/l walk, x deletes, so e/n/o are
-      // free. Named here rather than in the catcher — they mean something only to a list
-      // of tasks.
-      //
-      // Each one answers to its Cyrillic twin as well, by physical key position. The tasks
-      // in this popup are written in Russian, so the layout is Russian while reading them —
-      // and a command that only answers to the Latin letter is a command that does nothing
-      // exactly when it is wanted. Caught live: `n` typed a «п» into the field instead of
-      // opening it.
+      // free. Which letter means what — and which Cyrillic key sits in the same place —
+      // is decided in Api.mjs, where a test enumerates the pairs; here only the actions
+      // are wired, because only a list of tasks knows what they do.
       onTextKey: function(text) {
         var row = root.cursorRow
-        var key = ({ "у": "e", "т": "n", "щ": "o" })[text] || text
-        if (key === "e" && row && row.kind === "task") root.startRename(row.task)
-        else if (key === "n") addField.forceActiveFocus()
-        else if (key === "o" && row && row.kind === "task") root.openWeb(Api.taskWebUrl(row.task).url)
+        var action = Api.resolveActionKey(text)
+        if (action === "rename" && row && row.kind === "task") root.startRename(row.task)
+        else if (action === "add" && addField.enabled) addField.forceActiveFocus()
+        else if (action === "web" && row && row.kind === "task")
+          root.openWeb(Api.taskWebUrl(row.task).url)
+        else if (action === "undo") root.svc.undoComplete()
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       // The catcher folds h/l and the horizontal arrows into one signal, so horizontal
@@ -412,7 +433,17 @@ Panel {
         // The existing flag therefore already separates the two — no new mechanism needed.
         if (root.suppressNextActivate) { root.suppressNextActivate = false; return }
         var row = root.cursorRow
-        if (row && row.kind === "task") root.completeTask(row.task)
+        if (row && row.kind === "task") {
+          // Held Space would otherwise walk the list completing tasks: each one leaves the
+          // window, the cursor slides onto the next, and the next repeat takes that one
+          // too. The key repeat cannot be told apart here — the catcher's signal does not
+          // carry it, and Keys has no ignoreAutoRepeat — so the guard is time: nobody aims
+          // at two different tasks a quarter of a second apart.
+          var now = Date.now()
+          if (now - root.lastKeyCompleteAt < 400) return
+          root.lastKeyCompleteAt = now
+          root.completeTask(row.task)
+        }
         else root.activateCursor()
       }
 
@@ -614,6 +645,7 @@ Panel {
                     visible: active
                     sourceComponent: TaskDetails {
                       width: rowGroup.width
+                      leftPadding: taskRow.titleInset
                       task: rowGroup.modelData
                       foreground: root.contentForeground
                       fontFamily: root.contentFontFamily
@@ -648,7 +680,11 @@ Panel {
         TextField {
           id: addField
           width: parent.width - (root.addSending ? sendingMark.width + Style.space(6) : 0)
-          enabled: root.svc && root.svc.apiToken !== "" && !root.addSending
+          // readOnly, never `enabled: false`: disabling a focused field takes its focus
+          // away, and `blocked` is keyed on that focus — for half a second the popup would
+          // hand Space back to the list, completing whatever task sat under the cursor.
+          enabled: root.svc && root.svc.apiToken !== ""
+          readOnly: root.addSending
           placeholderText: root.addSending ? "отправляется…" : "новая задача во Входящие"
           text: root.addDraft
           onTextChanged: root.addDraft = text

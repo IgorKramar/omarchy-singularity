@@ -11,6 +11,8 @@ import {
   errorClass, unmatchedExcluded, emptyReason,
   toggleKey, isStale, priorityLabel, footerState,
   parseNote, taskFields, recurrenceState, taskWebUrl, WEB_BASE,
+  resolveActionKey, mutationAllowed, shouldDeferPoll, isStalePollResponse, mutationBody,
+  carryRecurrence,
   MUTATIONS, escapeCurlConfigValue, buildCurlConfig, buildRequestCommand,
   buildCreateBody, buildRenameBody, parseTask
 } from "../Api.mjs"
@@ -712,19 +714,19 @@ test("recurrenceState: отсутствие полей даёт «не знаю�
 test("taskFields показывает только заполненное и в постоянном порядке", () => {
   const full = { start: iso(2026, 8, 3), deadline: iso(2026, 8, 5), priority: 0,
                  recurrence: null, recurrenceGeneratorId: "" }
-  assert.deepEqual(full.deadline && taskFields(full, now).map((f) => f.label),
+  assert.deepEqual(full.deadline && taskFields(full).map((f) => f.label),
     ["начало", "дедлайн", "приоритет"])
   const bare = { start: iso(2026, 8, 3), deadline: null, priority: 1,
                  recurrence: null, recurrenceGeneratorId: "" }
-  assert.deepEqual(taskFields(bare, now).map((f) => f.label), ["начало"],
+  assert.deepEqual(taskFields(bare).map((f) => f.label), ["начало"],
     "ни дедлайна, ни обычного приоритета в списке быть не должно")
-  assert.deepEqual(taskFields(null, now), [])
+  assert.deepEqual(taskFields(null), [])
 })
 
 test("taskFields называет повтор отдельной строкой", () => {
   const rec = { start: iso(2026, 8, 3), deadline: null, priority: 1,
                 recurrence: null, recurrenceGeneratorId: "T-gen" }
-  assert.deepEqual(rec && taskFields(rec, now).map((f) => f.label), ["начало", "повтор"])
+  assert.deepEqual(rec && taskFields(rec).map((f) => f.label), ["начало", "повтор"])
 })
 
 test("taskWebUrl различает исходы и кодирует идентификатор", () => {
@@ -849,9 +851,105 @@ test("taskFields отдаёт дату сырой, а не отформатир�
   // проверяется ровно то, что сюда относится, — что значение уехало наружу нетронутым.
   const task = { start: iso(2026, 8, 3), deadline: iso(2026, 8, 5), priority: 0,
                  recurrence: null, recurrenceGeneratorId: "" }
-  const fields = taskFields(task, now)
+  const fields = taskFields(task)
   const start = fields.find((f) => f.label === "начало")
   assert.equal(start.kind, "date")
   assert.equal(start.value, task.start, "значение уехало нетронутым")
   assert.equal(fields.find((f) => f.label === "приоритет").kind, "text")
+})
+
+test("resolveActionKey знает обе раскладки и оба регистра", () => {
+  // Пары по позиции клавиши, а не по букве. Проверяется здесь, потому что промах молчалив:
+  // команда просто не срабатывает, и ровно это уже случилось живьём с `n`.
+  for (const [key, action] of [["e", "rename"], ["у", "rename"], ["E", "rename"], ["У", "rename"],
+                               ["n", "add"], ["т", "add"], ["N", "add"], ["Т", "add"],
+                               ["o", "web"], ["щ", "web"], ["O", "web"], ["Щ", "web"],
+                               ["u", "undo"], ["г", "undo"], ["U", "undo"], ["Г", "undo"]])
+    assert.equal(resolveActionKey(key), action, `клавиша ${key}`)
+  for (const key of ["j", "k", "h", "l", "x", "", " ", "з"])
+    assert.equal(resolveActionKey(key), "", `клавиша ${key} не команда`)
+})
+
+test("mutationAllowed отказывает повторяющейся задаче и незнакомой", () => {
+  const plain = { recurrence: null, recurrenceGeneratorId: "" }
+  const instance = { recurrence: null, recurrenceGeneratorId: "T-gen" }
+  const generator = { recurrence: { freq: "daily" }, recurrenceGeneratorId: "" }
+  assert.equal(mutationAllowed("complete", plain), true)
+  assert.equal(mutationAllowed("complete", instance), false, "экземпляр серии не отмечается")
+  assert.equal(mutationAllowed("complete", generator), false, "генератор тоже")
+  // Задачи нет в кэше — форма неизвестна. Отказ, а не догадка: цена догадки — погашенная серия.
+  assert.equal(mutationAllowed("complete", undefined), false)
+  assert.equal(mutationAllowed("complete", { id: "T-1" }), false, "поля повтора не пришли")
+  // Остальные операции гейт не трогает: переименовать экземпляр серии можно.
+  assert.equal(mutationAllowed("rename", instance), true)
+  assert.equal(mutationAllowed("create", undefined), true)
+})
+
+test("shouldDeferPoll уступает дорогу непустой очереди и летящей записи", () => {
+  assert.equal(shouldDeferPoll(0, ""), false, "тишина — можно опрашивать")
+  assert.equal(shouldDeferPoll(1, ""), true, "в очереди есть запись")
+  assert.equal(shouldDeferPoll(0, "T-1"), true, "запись в полёте")
+  assert.equal(shouldDeferPoll(0, "new"), true, "создание в полёте")
+})
+
+test("isStalePollResponse отбрасывает только отклик строго старше записи", () => {
+  assert.equal(isStalePollResponse(100, 200), true, "начался до записи — мир устарел")
+  assert.equal(isStalePollResponse(300, 200), false)
+  // Граница: одна и та же миллисекунда доказательством устаревания не является,
+  // а лишний отброс стоит целого круга до сервера.
+  assert.equal(isStalePollResponse(200, 200), false)
+  assert.equal(isStalePollResponse(100, 0), false, "записей ещё не было")
+})
+
+test("buildCurlConfig: POST без тела — форма, которой идёт каждая отметка", () => {
+  // Самая частая запись в плагине, и единственная без тела. Раньше проверялись только
+  // GET без тела и POST с телом — то есть ровно не та комбинация, что уходит по нажатию.
+  const cfg = buildCurlConfig("TOK", "POST", null)
+  assert.equal(cfg, 'header = "Authorization: Bearer TOK"\nrequest = "POST"\n')
+  assert.ok(!cfg.includes("Content-Type"), "без тела заголовок типа не нужен")
+  assert.ok(!cfg.includes("data ="), "и строки данных тоже")
+})
+
+test("buildCurlConfig: кавычка и слеш в токене не закрывают значение", () => {
+  // Свойство доказано для тела; токен ходит по тому же каналу и той же строкой конфигурации.
+  const cfg = buildCurlConfig('a"b\\c', "GET", null)
+  assert.equal(cfg, 'header = "Authorization: Bearer a\\"b\\\\c"\n')
+  const value = cfg.slice('header = "'.length, -2)
+  assert.ok(!/(^|[^\\])"/.test(value), "внутри значения не осталось незакрытой кавычки")
+})
+
+test("mutationBody различает «тела нет» и «отправлять нечего»", () => {
+  const now = new Date("2026-09-04T12:00:00+06:00")
+  assert.deepEqual(mutationBody("complete", "", now), { ok: true, body: null },
+    "отметка идёт без тела и это законно")
+  assert.equal(mutationBody("rename", "  ", now).ok, false, "пробельное название не отправляется")
+  assert.equal(mutationBody("create", "", now).ok, false)
+  assert.equal(mutationBody("rename", " Название ", now).body.title, "Название")
+  assert.equal(mutationBody("create", "Новая", now).body.title, "Новая")
+  assert.equal(mutationBody("create", "Новая", now).body.projectId, undefined,
+    "без проекта — это и есть Входящие")
+  assert.throws(() => mutationBody("delete", "x", now), /unknown mutation/,
+    "незнакомая операция обязана падать громко, а не отправлять пустоту")
+})
+
+test("carryRecurrence спасает генератор серии от отклика без правила повтора", () => {
+  // Форма снята с живого API: отклик записи несёт recurrenceGeneratorId и не несёт
+  // recurrence. У генератора правило лежит именно в recurrence, а ссылка пуста — значит
+  // без переноса переименованный генератор вернулся бы обычной задачей с живой галочкой.
+  const generator = { id: "T-1", title: "было", recurrence: { freq: "daily" }, recurrenceGeneratorId: "" }
+  const answer = { id: "T-1", title: "стало", recurrenceGeneratorId: "" }
+  const merged = carryRecurrence(generator, answer)
+  assert.equal(merged.title, "стало", "название из отклика")
+  assert.equal(mutationAllowed("complete", merged), false, "и серия по-прежнему защищена")
+
+  // Экземпляр серии защищён своей ссылкой и без переноса.
+  const instance = { id: "T-2", recurrence: null, recurrenceGeneratorId: "T-1" }
+  assert.equal(mutationAllowed("complete", carryRecurrence(instance, { id: "T-2", recurrenceGeneratorId: "T-1" })), false)
+
+  // Обычная задача остаётся обычной, а отклик с собственным правилом не подменяется прежним.
+  const plain = { id: "T-3", recurrence: null, recurrenceGeneratorId: "" }
+  assert.equal(mutationAllowed("complete", carryRecurrence(plain, { id: "T-3", recurrenceGeneratorId: "" })), true)
+  assert.deepEqual(carryRecurrence(plain, { id: "T-3", recurrence: { freq: "weekly" } }).recurrence,
+    { freq: "weekly" }, "пришедшее правило важнее прежнего")
+  assert.equal(carryRecurrence(undefined, answer), answer, "прежней версии нет — переносить нечего")
 })

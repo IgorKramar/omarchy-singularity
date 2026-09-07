@@ -6,9 +6,8 @@
 ![Omarchy](https://img.shields.io/badge/Omarchy-shell%20plugin-7aa2f7)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
-> **Status: in development.** The bar pill, the popup and the headless service work; the
-> overlay is not built yet, and the popup is read-only — checking off, inline edit and quick
-> add are still to come.
+> **Status: in development.** The bar pill, the popup and the headless service work, and the
+> popup completes, renames and adds tasks. The overlay is not built yet.
 
 ## What it will be
 
@@ -60,6 +59,10 @@ back on failure — so the row keeps its place and wears a "sent" mark until the
 A write that fails says so in the footer and leaves the list alone; it never repaints the
 popup as a broken service, because one checkbox that did not save is not an outage.
 
+A completed task leaves the window at once and the next poll is up to ten minutes away, so
+the footer offers the way back: **`u` undoes the last completion**, naming the task it will
+return. One step deep — the offer is about the keystroke that just happened, not a history.
+
 **A recurring task shows a repeat glyph instead of a checkbox.** Such a task is two objects in
 SingularityApp — a generator and the instances it produces — and completing an instance
 through this API is not something the API offers. A dimmed checkbox would still read as a
@@ -82,6 +85,7 @@ sending anything.
 | `e` `у` | rename the selected task in place |
 | `n` `т` | jump to the new-task field at the bottom |
 | `o` `щ` | open the selected task's project in the web app |
+| `u` `г` | undo the last completion |
 | `Tab` `Shift+Tab` | move to the neighbouring bar panel |
 | `Esc` | leave the field, or close the popup |
 

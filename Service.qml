@@ -128,11 +128,10 @@ Item {
   function refresh() {
     if (root.apiToken === "") return
     if (root.inFlight) { root.refreshPending = true; return }
-    // A poll started now would race a mutation already in flight: merge is last-writer-wins
-    // by id with no modified-time comparison, so a poll that began before the checkbox and
-    // arrives after its response puts the pre-completion task straight back in the window.
-    // The user would watch a completed task reappear and the numbers roll back.
-    if (root.mutationQueue.length > 0 || root.mutatingId !== "") { root.refreshPending = true; return }
+    if (Api.shouldDeferPoll(root.mutationQueue.length, root.mutatingId)) {
+      root.refreshPending = true
+      return
+    }
     var now = new Date()
     var today = root.dayKey(now)
     var full = root.fullFetchPending || root.lastSync === "" || root.lastFullFetchDay !== today
@@ -188,10 +187,13 @@ Item {
   function enqueueMutation(op, id, title) {
     if (root.apiToken === "") return false
     if (id !== "" && root.pendingIds.indexOf(id) !== -1) return false   // already sent
+    // The guard lives here, not in the popup: the IPC handler reaches the same POST, and a
+    // rule enforced in one caller is not a rule. Completing an instance of a recurring
+    // series is what this refuses.
+    if (!Api.mutationAllowed(op, root.taskById(id))) return false
     // Validate before queueing, not while draining: a blank title rejected downstream
     // still answered the caller "ok" for something that was never going to be sent.
-    if (op === "create" && Api.buildCreateBody(title, new Date()) === null) return false
-    if (op === "rename" && Api.buildRenameBody(title) === null) return false
+    if (!Api.mutationBody(op, title, new Date()).ok) return false
     var q = root.mutationQueue.slice()
     q.push({ id: id, op: op, title: title || "" })
     root.mutationQueue = q
@@ -211,11 +213,13 @@ Item {
     mutationProc.entryId = entry.id
     mutationProc.op = entry.op
 
-    var now = new Date()
     var spec = Api.MUTATIONS[entry.op](entry.id)
-    var body = entry.op === "create" ? Api.buildCreateBody(entry.title, now)
-      : entry.op === "rename" ? Api.buildRenameBody(entry.title) : null
-    root.runAuthedRequest(mutationProc, Api.BASE_URL + spec.path, spec.method, body)
+    // Remembered, not re-read on return: a response that comes back after the token changed
+    // describes another account's world, and merging it would put foreign tasks in this
+    // session's cache.
+    mutationProc.issuedToken = root.apiToken
+    root.runAuthedRequest(mutationProc, Api.BASE_URL + spec.path, spec.method,
+      Api.mutationBody(entry.op, entry.title, new Date()).body)
   }
 
   // Every exit funnels here — success, non-zero code, an empty token, a timeout. A path
@@ -236,6 +240,30 @@ Item {
     root.pendingIds = []
     root.mutatingId = ""
     root.mutationError = ""
+    // The undo belongs to the credential that made the completion; offering it after a
+    // token change would aim it at another account's task id.
+    root.undoableId = ""
+    root.undoableTitle = ""
+  }
+
+  // The last completion, kept so it can be taken back. One deep, not a stack: the popup
+  // offers one undo for the keystroke that just happened, and a history nobody can see
+  // would only invite guessing about which task comes back.
+  property string undoableId: ""
+  property string undoableTitle: ""
+
+  function undoComplete() {
+    if (root.undoableId === "") return false
+    var id = root.undoableId
+    root.undoableId = ""
+    root.undoableTitle = ""
+    return root.enqueueMutation("uncomplete", id, "")
+  }
+
+  function taskById(id) {
+    for (var i = 0; i < root.allTasks.length; i++)
+      if (root.allTasks[i].id === id) return root.allTasks[i]
+    return undefined   // absent from the window: unknown shape, and mutationAllowed refuses
   }
 
   function complete(id) { return root.enqueueMutation("complete", id, "") }
@@ -246,11 +274,14 @@ Item {
     id: mutationProc
     property string entryId: ""
     property string op: ""
+    property string issuedToken: ""
     stdout: StdioCollector { id: mutationOut; waitForEnd: true }
     stderr: StdioCollector { id: mutationErr; waitForEnd: true }
     onExited: function(exitCode) {
       var id = mutationProc.entryId
-      if (root.apiToken === "") {   // token removed mid-flight: no-token stays the truth
+      // Not "is there a token now" but "is it still the one this write was issued under" —
+      // an empty token and a different account's token are both reasons to drop the answer.
+      if (root.apiToken !== mutationProc.issuedToken) {
         root.abandonMutations()
         return
       }
@@ -269,9 +300,19 @@ Item {
         return
       }
       // The response is the task itself, so it goes through the same merge as a poll:
-      // isCurrent already drops a completed task, so the window needs no new filter.
-      root.allTasks = Api.merge(root.allTasks, [task], new Date())
+      // isCurrent already drops a completed task, so the window needs no new filter. What
+      // the response does not carry — the recurrence rule — is carried across from the copy
+      // we already hold, so a series cannot lose its protection by being renamed.
+      root.allTasks = Api.merge(root.allTasks,
+        [Api.carryRecurrence(root.taskById(task.id), task)], new Date())
       root.mutationError = ""
+      if (mutationProc.op === "complete") {
+        root.undoableId = task.id
+        root.undoableTitle = task.title
+      } else if (mutationProc.op === "uncomplete") {
+        root.undoableId = ""
+        root.undoableTitle = ""
+      }
       root.recompute()
       root.mutated(task.id, mutationProc.op)
       root.finishMutation(id, true)
@@ -302,11 +343,11 @@ Item {
         root.finishWithError(msg !== "" ? msg : "curl exited with code " + exitCode)
         return
       }
-      // This response left the server before the last mutation landed, so it describes a
-      // world where that mutation had not happened. Merging it would put the completed
-      // task back in the window and roll the numbers back — a coherent, false picture the
-      // user would have to wait out. Throw it away and ask again.
-      if (taskProc.startedAt < root.lastMutationAt) {
+      if (Api.isStalePollResponse(taskProc.startedAt, root.lastMutationAt)) {
+        // The retry must ask for the same thing the discarded request asked for: a full
+        // fetch thrown away here would come back as an increment, and the day's rebuild
+        // would silently not happen until tomorrow.
+        root.fullFetchPending = root.fullFetchPending || taskProc.full
         root.inFlight = false
         root.refreshPending = true
         root.drainPending()
@@ -431,7 +472,9 @@ Item {
         mutatingId: root.mutatingId,
         pendingIds: root.pendingIds,
         mutationQueued: root.mutationQueue.length,
-        mutationError: root.mutationError
+        mutationError: root.mutationError,
+        undoableId: root.undoableId,
+        undoableTitle: root.undoableTitle
       })
     }
 
@@ -450,6 +493,10 @@ Item {
 
     function complete(id: string): string {
       return root.complete(id) ? "ok" : "rejected"
+    }
+
+    function undo(): string {
+      return root.undoComplete() ? "ok" : "nothing-to-undo"
     }
 
     function add(title: string): string {

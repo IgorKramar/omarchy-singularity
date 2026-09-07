@@ -138,7 +138,12 @@ export function merge(cache, incoming, now) {
 }
 
 function sameTasks(a, b) {
-  return a.length === b.length && a.every((t, i) => JSON.stringify(t) === JSON.stringify(b[i]))
+  // Reference first: an entry no poll touched keeps its identity through merge's Map, and
+  // that is the common case. Serialising it anyway grew costlier once tasks began carrying
+  // their note — several hundred characters re-encoded per task per poll to prove what the
+  // identity check proves for free.
+  return a.length === b.length
+    && a.every((t, i) => t === b[i] || JSON.stringify(t) === JSON.stringify(b[i]))
 }
 
 // --- Project filter and counters (SNG-2) ---
@@ -479,8 +484,14 @@ export function isStale(lastSync, now, thresholdMs = FRESHNESS_MS) {
 // 0 = HIGH, 1 = NORMAL, 2 = LOW — the API's own scale, and it runs the opposite way round
 // from the guess, which is why it is pinned by a test rather than by a reader's memory.
 // Only the two ends are marked; normal is the silent default.
+//
+// One table, two spellings: the row has no width for a whole word, the expansion has no
+// reason to abbreviate. A second table would be a second place to fix if the scale ever
+// turns out wrong — and this is precisely the fact that was already guessed wrong once.
+const PRIORITY = { 0: { short: "выс", full: "высокий" }, 2: { short: "низ", full: "низкий" } }
+
 export function priorityLabel(priority) {
-  return priority === 0 ? "выс" : priority === 2 ? "низ" : ""
+  return PRIORITY[priority] ? PRIORITY[priority].short : ""
 }
 
 export function isHighPriority(priority) {
@@ -535,12 +546,10 @@ export function parseNote(value) {
   return { text, state: "ok" }
 }
 
-const PRIORITY_NAMES = { 0: "высокий", 2: "низкий" }
-
 // Only fields that carry a value. 29 of the API's 39 are empty on every task in this
 // account, so rendering them all would be a screen of blank rows. The project is the
 // section header already and is not repeated here.
-export function taskFields(task, now) {
+export function taskFields(task) {
   if (!task) return []
   const out = []
   // Dates leave here as their raw value with `kind: "date"`, not as formatted text: the
@@ -549,8 +558,8 @@ export function taskFields(task, now) {
   // caller formats through Qt.locale, the way the row already formats its deadline.
   if (task.start) out.push({ label: "начало", value: task.start, kind: "date" })
   if (task.deadline) out.push({ label: "дедлайн", value: task.deadline, kind: "date" })
-  const p = PRIORITY_NAMES[task.priority]
-  if (p) out.push({ label: "приоритет", value: p, kind: "text" })
+  const p = PRIORITY[task.priority]
+  if (p) out.push({ label: "приоритет", value: p.full, kind: "text" })
   if (recurrenceState(task) === "recurring") out.push({ label: "повтор", value: "да", kind: "text" })
   return out
 }
@@ -589,12 +598,14 @@ export function taskWebUrl(task) {
 
 // --- Write surface (SNG-3.1) ---
 
-const pad2 = (n) => String(n).padStart(2, "0")
-
 // Every mutation the popup can issue. The verb and path live here so QML names an
 // operation, never a URL and never an HTTP method.
 export const MUTATIONS = {
   complete: (id) => ({ method: "POST", path: "/v2/task/" + encodeURIComponent(id) + "/complete" }),
+  // The way back. A completed task leaves the window immediately and the next poll is up
+  // to ten minutes away, so without this a mis-aimed keystroke is unrecoverable from the
+  // popup — which is exactly how it was found.
+  uncomplete: (id) => ({ method: "POST", path: "/v2/task/" + encodeURIComponent(id) + "/uncomplete" }),
   rename: (id) => ({ method: "PATCH", path: "/v2/task/" + encodeURIComponent(id) }),
   create: () => ({ method: "POST", path: "/v2/task" })
 }
@@ -634,18 +645,20 @@ export function buildRequestCommand(url) {
 // A task created from the popup lands in Входящие — which in SingularityApp is the
 // absence of a project, not a project of that name (verified: none of the 33 projects
 // carries it). Sending no `projectId` is therefore the whole of it.
+const cleanTitle = (v) => String(v == null ? "" : v).trim()
+
 export function buildCreateBody(title, now) {
-  const clean = String(title == null ? "" : title).trim()
+  const clean = cleanTitle(title)
   if (clean === "") return null
   // Morning of the local day, written the way endOfDay writes its own timestamp: the API
   // normalises the offset to UTC, so the offset must be the local one, not a hardcoded Z.
   const d = startOfDay(now)
-  const stamp = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T09:00:00${localOffset(d)}`
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T09:00:00${localOffset(d)}`
   return { title: clean, start: stamp }
 }
 
 export function buildRenameBody(title) {
-  const clean = String(title == null ? "" : title).trim()
+  const clean = cleanTitle(title)
   if (clean === "") return null
   return { title: clean }
 }
@@ -656,4 +669,83 @@ export function parseTask(text, now) {
   const data = parseJson(text)
   if (!data || typeof data !== "object" || !data.id) throw new Error("response has no task")
   return normalizeTask(data, now)
+}
+
+// --- Decisions the popup used to make in QML (SNG-3.1 review) ---
+//
+// Everything below decided something inside Panel.qml or Service.qml, where `node --test`
+// cannot reach it. Each one fails silently when wrong — a command that does nothing, a
+// series quietly extinguished, a completed task walking back into the window — which is
+// exactly the boundary AGENTS.md draws: if the error is silent, the decision lives here.
+
+// Physical key position, not letter identity. The tasks in this popup are Russian, so the
+// layout is Russian while reading them, and a command bound to the Latin letter alone goes
+// silent precisely when it is wanted (caught live: `n` typed a «п» into the field). Both
+// cases, because Shift and CapsLock are not a different intent.
+const ACTION_KEYS = {
+  e: "rename", E: "rename", у: "rename", У: "rename",
+  n: "add", N: "add", т: "add", Т: "add",
+  o: "web", O: "web", щ: "web", Щ: "web",
+  u: "undo", U: "undo", г: "undo", Г: "undo"
+}
+
+export function resolveActionKey(text) {
+  return ACTION_KEYS[text] || ""
+}
+
+// May this write be sent at all? Asked at the service boundary rather than in the panel,
+// because the panel is not the only caller: the IPC handler reaches the same POST, and a
+// guard that lives in one caller is not a guard.
+//
+// A recurring task is two objects — a generator and the instances it produces — and
+// completing an instance is not something this API offers. A task that is not in the cache
+// resolves to "unknown" and is refused by construction: declining costs a keystroke,
+// guessing costs a series.
+export function mutationAllowed(op, task) {
+  if (op !== "complete") return true
+  return recurrenceState(task) === "none"
+}
+
+// A poll started now would race a write already in flight. `merge` is last-writer-wins by
+// id with no modified-time comparison, so a poll that began before the checkbox and lands
+// after its response puts the pre-completion task straight back in the window.
+export function shouldDeferPoll(queueLength, mutatingId) {
+  return queueLength > 0 || mutatingId !== ""
+}
+
+// This response left the server before the last write landed, so it describes a world
+// where that write had not happened. Strictly older, not older-or-equal: a response that
+// started in the same millisecond as the mutation finished is not evidence of a stale
+// world, and discarding it would cost a round trip for nothing.
+export function isStalePollResponse(startedAt, lastMutationAt) {
+  return startedAt < lastMutationAt
+}
+
+// What body an operation sends, and whether it may be sent at all — one answer instead of
+// the same three-way branch written twice in Service.qml (once to validate at queue time,
+// once to build at send time). Those two copies could disagree, and the disagreement would
+// show up as a request answered "ok" that was never sent.
+//
+// `complete` has no body and is still valid; a blank title is invalid and has none. Those
+// are different facts, so they do not share the `null` return that once carried both.
+export function mutationBody(op, title, now) {
+  if (op === "complete" || op === "uncomplete") return { ok: true, body: null }
+  const body = op === "create" ? buildCreateBody(title, now)
+    : op === "rename" ? buildRenameBody(title) : undefined
+  if (body === undefined) throw new Error("unknown mutation: " + op)
+  return body === null ? { ok: false, body: null } : { ok: true, body: body }
+}
+
+// A write answers with the whole task — but not quite the whole one. Measured against the
+// live API: the response carries `recurrenceGeneratorId` and omits `recurrence` entirely.
+// For an instance of a series that is harmless (the link field still says "recurring"),
+// but a generator carries the rule and an *empty* link, so a renamed generator would come
+// back looking like an ordinary task, grow a live checkbox, and one click would put out
+// the series. Carry the rule across rather than trust a field that did not travel.
+export function carryRecurrence(prev, next) {
+  if (!prev || !next) return next
+  if (next.recurrence !== undefined || prev.recurrence === undefined) return next
+  const out = Object.assign({}, next)
+  out.recurrence = prev.recurrence
+  return out
 }
