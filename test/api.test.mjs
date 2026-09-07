@@ -16,7 +16,7 @@ import {
   zoneOf, storeGroups, overlayView, OVERLAY_ZONES,
   resolveZoneKey, buildMoveBody, morningOf,
   overlayColumns, overlayCursorAt, moveOverlayCursor, overlayCursorAfter,
-  checklistQuery, parseChecklist, checklistToggleOp, mergeChecklist, CHECKLIST_MUTATIONS, CHECKLIST_FIELDS,
+  checklistQuery, parseChecklist, checklistToggleOp, mergeChecklist, CHECKLIST_MUTATIONS,
   MUTATIONS, escapeCurlConfigValue, buildCurlConfig, buildRequestCommand,
   buildCreateBody, buildRenameBody, parseTask
 } from "../Api.mjs"
@@ -1334,10 +1334,13 @@ test("overlayCursorAt находит позицию по id", () => {
 const items = (list) => JSON.stringify({ checklistItems: list })
 const item = (over) => ({ id: "CH-1", parent: "T-1", title: "пункт", done: false, parentOrder: 0, removed: false, ...over })
 
-test("checklistQuery выбирает по родителю", () => {
+test("checklistQuery не называет поля — иначе removed уронит запрос", () => {
+  // Проверено живым API: fields=…,removed → HTTP 400 «UNKNOWN_FIELD: removed». При этом в
+  // полном ответе поле есть и работает. Тот же капкан, что SNG-7 нашла у задач.
   const q = checklistQuery("T-1")
   assert.equal(q["parent.eq"], "T-1")
-  assert.equal(q.fields, CHECKLIST_FIELDS.join(","))
+  assert.ok(!("fields" in q), "список полей не задаём: без него приходит всё, включая removed")
+  assert.equal(q.maxCount, MAX_COUNT)
 })
 
 test("parseChecklist: пустой список — это пустой список, а не ошибка", () => {

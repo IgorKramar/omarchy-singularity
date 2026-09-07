@@ -107,8 +107,12 @@ Item {
         task: modelData
         hasCursor: modelData.id === root.cursorId
         expanded: modelData.id === root.expandedId
+        // Read straight off the property, not through service.checklistFor(): a binding
+        // tracks the properties it reads, and a value arriving through a method call leaves
+        // it with nothing to depend on — the card kept saying "нет пунктов" while the cache
+        // held the items.
         checklist: root.service && root.expandedId === modelData.id
-          ? root.service.checklistFor(modelData.id) : []
+          ? (root.service.checklists[modelData.id] || []) : []
         pendingItems: root.service ? root.service.checklistPending : []
         sending: root.service ? root.service.pendingIds.indexOf(modelData.id) !== -1 : false
         onActivated: root.cardActivated(modelData.id)

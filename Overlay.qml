@@ -79,18 +79,39 @@ Item {
     root.cursorId = Api.overlayCursorAfter(root.columns, root.cursorId, previous)
   }
 
+  function screenNamed(name) {
+    var screens = Quickshell.screens || []
+    for (var i = 0; i < screens.length; i++)
+      if (screens[i] && screens[i].name === name) return screens[i]
+    return null
+  }
+
   function focusedScreen() {
     var monitor = Hyprland.focusedMonitor
+    var byFocus = monitor ? root.screenNamed(monitor.name) : null
+    if (byFocus) return byFocus
     var screens = Quickshell.screens || []
-    if (monitor)
-      for (var i = 0; i < screens.length; i++)
-        if (screens[i] && screens[i].name === monitor.name) return screens[i]
     return screens.length > 0 ? screens[0] : null
+  }
+
+  // The payload the shell hands `summon`/`toggle` through. `{"screen":"HDMI-A-1"}` pins the
+  // overlay to one monitor; without it, it follows the focus. SNG-6 will use this to bind a
+  // hotkey to a chosen screen, and it keeps a test from having to steer the focus of a
+  // machine someone is working on.
+  function requestedScreen(payloadJson) {
+    try {
+      var payload = JSON.parse(payloadJson || "{}")
+      if (payload && typeof payload.screen === "string" && payload.screen !== "")
+        return root.screenNamed(payload.screen)
+    } catch (e) {
+      // A malformed payload is not a reason to refuse to open: fall back to the focus.
+    }
+    return null
   }
 
   function open(payloadJson) {
     Hyprland.refreshMonitors()
-    root.targetScreen = root.focusedScreen()
+    root.targetScreen = root.requestedScreen(payloadJson) || root.focusedScreen()
     root.rebuild()
     if (root.cursorId === "" && root.columns.length > 0)
       root.cursorId = Api.moveOverlayCursor(root.columns, "", 0, 1)
@@ -113,9 +134,9 @@ Item {
       root.shell.hide((root.manifest && root.manifest.id) || "io.github.igorkramar.singularity")
   }
 
-  function toggle() {
+  function toggle(payloadJson) {
     if (root.opened) root.dismiss()
-    else root.open("{}")
+    else root.open(payloadJson || "{}")
   }
 
   function moveCursor(dx, dy) {

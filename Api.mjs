@@ -988,10 +988,14 @@ export function overlayCursorAfter(columns, id, previousColumns) {
 // Measured against the live API: the answer is keyed `checklistItems`, an item carries
 // `done` and, unlike a task, a working `removed` flag. `/check` and `/uncheck` answer with
 // the item itself.
-export const CHECKLIST_FIELDS = ["id", "parent", "title", "done", "parentOrder", "removed"]
-
+// No `fields` at all, and that is the whole point: `removed` comes back in a full answer but
+// cannot be *asked for* — `fields=…,removed` is HTTP 400, "UNKNOWN_FIELD: removed; allowed:
+// [id, modificatedDate, parent, parentOrder, title, done, crypted]". Exactly the trap SNG-7
+// hit on tasks, one resource over. Naming the allowed fields would fetch a list with no way
+// to tell a deleted item from a live one; asking for nothing returns everything, including
+// the flag.
 export function checklistQuery(taskId) {
-  return { "parent.eq": String(taskId), maxCount: MAX_COUNT, fields: CHECKLIST_FIELDS.join(",") }
+  return { "parent.eq": String(taskId), maxCount: MAX_COUNT }
 }
 
 export const CHECKLIST_MUTATIONS = {
