@@ -22,7 +22,7 @@ Item {
   property string errorText: ""
   // The full window as the API sees it. Merging and the quiet gate work on this, never on
   // `tasks`: merging onto the filtered view would drop excluded tasks out of the cache for
-  // good, and clearing the filter would not bring them back until the next full poll.
+  // good, and clearing the filter would not bring them back until the next poll.
   property var allTasks: []
   // The filtered view every surface reads — the filter applies plugin-wide by construction.
   property var tasks: []
@@ -41,9 +41,16 @@ Item {
   property string apiToken: ""
   property bool inFlight: false
   property bool refreshPending: false
-  property bool fullFetchPending: false
-  property string lastFullFetchDay: ""
-  property double lastRequestStartedAt: 0
+  // Projects, not tasks. Tasks are fetched whole on every poll (SNG-7); these two decide
+  // only whether to also ask for the project list, which changes on the order of weeks.
+  // The flag is the "on demand" half of that rule — a new token, a project filter set before
+  // any project names have arrived, and the `refresh` IPC command each raise it.
+  property bool projectsFetchPending: false
+  property string lastProjectFetchDay: ""
+  // The token the in-flight project request was issued under, for the same reason the write
+  // path remembers its own: a list that comes back after the token changed describes another
+  // account, and merging it would put foreign project names in this session's cache.
+  property string issuedProjectToken: ""
 
   function dayKey(date) {
     return date.getFullYear() + "-" + (date.getMonth() + 1) + "-" + date.getDate()
@@ -84,7 +91,7 @@ Item {
       return
     }
     chmodProc.running = true
-    root.fullFetchPending = true
+    root.projectsFetchPending = true
     root.refresh()
   }
 
@@ -113,11 +120,11 @@ Item {
   }
 
   onExcludedProjectsChanged: {
-    // A list set before projects have ever arrived would silently do nothing; ask for the
-    // full fetch whose tail carries them.
+    // A list set before projects have ever arrived would silently do nothing; ask for a
+    // poll, whose tail is what fetches the project names.
     if (Api.normalizeExcluded(root.excludedProjects).size > 0
         && root.projects.length === 0 && root.apiToken !== "") {
-      root.fullFetchPending = true
+      root.projectsFetchPending = true
       root.refresh()
     }
     if (root.recompute()) root.changed()
@@ -133,15 +140,10 @@ Item {
       return
     }
     var now = new Date()
-    var today = root.dayKey(now)
-    var full = root.fullFetchPending || root.lastSync === "" || root.lastFullFetchDay !== today
-    var params = full ? Api.todayQuery(now) : Api.incrementalQuery(root.lastRequestStartedAt)
-    root.fullFetchPending = false
     root.inFlight = true
     if (root.status !== "ready") root.status = "loading"   // a background poll keeps `ready`; the quiet gate below depends on it
-    taskProc.full = full
     taskProc.startedAt = now.getTime()
-    root.runAuthedCurl(taskProc, Api.buildUrl("/v2/task", params))
+    root.runAuthedCurl(taskProc, Api.buildUrl("/v2/task", Api.todayQuery(now)))
   }
 
   // The whole request — token, verb, headers, body — goes to curl as a `-K -` config on
@@ -328,7 +330,6 @@ Item {
 
   Process {
     id: taskProc
-    property bool full: false
     property double startedAt: 0
     stdout: StdioCollector { id: taskOut; waitForEnd: true }
     stderr: StdioCollector { id: taskErr; waitForEnd: true }
@@ -344,10 +345,6 @@ Item {
         return
       }
       if (Api.isStalePollResponse(taskProc.startedAt, root.lastMutationAt)) {
-        // The retry must ask for the same thing the discarded request asked for: a full
-        // fetch thrown away here would come back as an increment, and the day's rebuild
-        // would silently not happen until tomorrow.
-        root.fullFetchPending = root.fullFetchPending || taskProc.full
         root.inFlight = false
         root.refreshPending = true
         root.drainPending()
@@ -363,17 +360,27 @@ Item {
       }
       if (incoming.length >= Api.MAX_COUNT)
         console.warn(root.pluginId + ": task list hit maxCount=" + Api.MAX_COUNT + ", the window may be truncated")
-      var next = Api.merge(taskProc.full ? [] : root.allTasks, incoming, now)
+      var next = Api.mergeFull(root.allTasks, incoming, now)
       var quiet = next === root.allTasks && root.status === "ready" && root.errorText === ""
       root.allTasks = next
-      root.lastRequestStartedAt = taskProc.startedAt
       root.lastSync = now.toISOString()
-      if (taskProc.full) root.lastFullFetchDay = root.dayKey(new Date(taskProc.startedAt))   // the query window was built at request start
       root.errorText = ""
       root.status = "ready"
       var visibleChanged = root.recompute()
       if (!quiet || visibleChanged) root.changed()
-      if (taskProc.full) {
+      // Projects are asked for once a local day, or whenever something raised the flag.
+      // Tasks no longer decide this: they are fetched whole every time.
+      //
+      // One day value for both the question and the answer: the poll started at
+      // `taskProc.startedAt`, and asking with one day while recording another would let a
+      // request that straddles midnight claim the wrong day.
+      var startDay = root.dayKey(new Date(taskProc.startedAt))
+      if (Api.shouldFetchProjects(root.projectsFetchPending, root.lastProjectFetchDay, startDay)) {
+        // The flag is not cleared here. It is the only carrier of "someone asked out of
+        // turn", and a request that fails would take that request with it — the names would
+        // then wait for tomorrow, which is the very thing this flag exists to prevent.
+        projectProc.forDay = startDay
+        root.issuedProjectToken = root.apiToken
         root.runAuthedCurl(projectProc, Api.buildUrl("/v2/project", Api.projectsQuery()))
       } else {
         root.inFlight = false
@@ -382,14 +389,17 @@ Item {
     }
   }
 
-  // Projects ride on the tail of a successful full fetch; a failure here is reported
+  // Projects ride on the tail of a successful task poll; a failure here is reported
   // but neither changes `status` nor clears the project cache.
   Process {
     id: projectProc
+    // The day this request was built for. Written to the day key only on success, so a
+    // failed project fetch does not claim "already fetched today" and cost a day of names.
+    property string forDay: ""
     stdout: StdioCollector { id: projectOut; waitForEnd: true }
     stderr: StdioCollector { id: projectErr; waitForEnd: true }
     onExited: function(exitCode) {
-      if (root.apiToken === "") {
+      if (root.apiToken !== root.issuedProjectToken) {   // answer from another account
         root.inFlight = false
         root.refreshPending = false
         return
@@ -400,12 +410,17 @@ Item {
       } else {
         try {
           root.projects = Api.parseProjects(projectOut.text)
+          // Both marks of success, written together and only here: the day is claimed and
+          // the out-of-turn request is answered. A failure leaves both as they were, so the
+          // next poll asks again instead of waiting for tomorrow.
+          root.lastProjectFetchDay = projectProc.forDay
+          root.projectsFetchPending = false
         } catch (e) {
           root.errorText = "projects: " + String(e.message || e)
         }
       }
       root.inFlight = false
-      root.recompute()   // names become resolvable only now, on the first full poll
+      root.recompute()   // names become resolvable only now, on the first project fetch
       root.changed()
       root.drainPending()
     }
@@ -510,7 +525,7 @@ Item {
     function refresh(): string {
       settingsFile.reload()
       if (root.apiToken === "") return "no-token"
-      root.fullFetchPending = true
+      root.projectsFetchPending = true
       root.refresh()
       return "ok"
     }
