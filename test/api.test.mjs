@@ -15,6 +15,7 @@ import {
   carryRecurrence,
   zoneOf, storeGroups, overlayView, OVERLAY_ZONES,
   resolveZoneKey, buildMoveBody, morningOf,
+  overlayColumns, overlayCursorAt, moveOverlayCursor, overlayCursorAfter,
   MUTATIONS, escapeCurlConfigValue, buildCurlConfig, buildRequestCommand,
   buildCreateBody, buildRenameBody, parseTask
 } from "../Api.mjs"
@@ -1264,4 +1265,64 @@ test("AE2: перенос на завтра счётчик пилюли не т�
   assert.equal(zoneOf(moved, now), "tomorrow")
   assert.equal(isCurrent(moved, now), false, "завтра в окно не входит — число на пилюле прежнее")
   assert.equal(isCached(moved), true, "но из кэша не исчезает: карточка остаётся на экране")
+})
+
+
+// --- Оверлей: курсор по колонкам (SNG-4, U5) ---
+
+const overlayOf = (tasks) => overlayColumns(overlayView(null, { tasks, projects: proj, now }))
+
+test("overlayColumns: стопки склада слева, три дня справа", () => {
+  const cols = overlayOf([
+    task({ id: "s1", start: null }), task({ id: "s2", start: null, projectId: "P-2" }),
+    task({ id: "o", start: yesterday }), task({ id: "t", start: today }), task({ id: "m", start: tomorrow })
+  ])
+  assert.deepEqual(cols.map((c) => c.zone), ["store", "store", "overdue", "today", "tomorrow"])
+  assert.deepEqual(cols.slice(-3).map((c) => c.title), ["Просрочено", "Сегодня", "Завтра"])
+})
+
+test("курсор ходит стрелками по колонкам и внутри колонки", () => {
+  const cols = overlayOf([
+    task({ id: "s1", start: null }), task({ id: "s2", start: null }),
+    task({ id: "t1", start: today }), task({ id: "t2", start: iso(2026, 8, 3, 15) })
+  ])
+  assert.equal(moveOverlayCursor(cols, "", 0, 1), "s1", "курсора не было — встаёт на первую карточку")
+  const second = moveOverlayCursor(cols, "s1", 0, 1)
+  assert.notEqual(second, "s1", "вниз внутри стопки")
+  assert.equal(moveOverlayCursor(cols, second, 0, -1), "s1", "и обратно вверх")
+  const right = moveOverlayCursor(cols, "s1", 1, 0)
+  assert.ok(["t1", "t2"].includes(right), "вправо — в колонку дня")
+  assert.equal(moveOverlayCursor(cols, right, -1, 0), "s1", "влево — назад на склад")
+})
+
+test("курсор не выходит за края и не заворачивается", () => {
+  // Заворот с последней карточки на первую читается как «курсор не сдвинулся».
+  const cols = overlayOf([task({ id: "a", start: today }), task({ id: "b", start: iso(2026, 8, 3, 15) })])
+  const first = cols.find((c) => c.zone === "today").tasks[0].id
+  assert.equal(moveOverlayCursor(cols, first, 0, -1), first, "вверх с первой — остаётся")
+  const last = cols.find((c) => c.zone === "today").tasks[1].id
+  assert.equal(moveOverlayCursor(cols, last, 0, 1), last, "вниз с последней — остаётся")
+  assert.equal(moveOverlayCursor(cols, first, -1, 0), first, "левее первой колонки некуда")
+})
+
+test("пустые колонки перешагиваются, а не занимаются курсором", () => {
+  // В колонке без карточек курсору не над чем работать, и каждое следующее нажатие
+  // выглядело бы как «ничего не происходит».
+  const cols = overlayOf([task({ id: "s", start: null }), task({ id: "m", start: tomorrow })])
+  assert.equal(cols.find((c) => c.zone === "today").tasks.length, 0, "сегодня пусто")
+  assert.equal(moveOverlayCursor(cols, "s", 1, 0), "m", "вправо со склада — сразу в «Завтра»")
+})
+
+test("курсор не теряется, когда карточка уехала в другую колонку", () => {
+  const before = overlayOf([task({ id: "a", start: null }), task({ id: "b", start: null })])
+  const after = overlayOf([task({ id: "b", start: null })])
+  assert.equal(overlayCursorAfter(after, "a", before), "b", "остаётся в той же стопке рядом")
+  assert.equal(overlayCursorAfter(after, "b", before), "b", "карточка на месте — курсор не двигается")
+  assert.equal(overlayCursorAfter(overlayOf([]), "b", before), "", "показывать нечего")
+})
+
+test("overlayCursorAt находит позицию по id", () => {
+  const cols = overlayOf([task({ id: "s", start: null }), task({ id: "t", start: today })])
+  assert.deepEqual(overlayCursorAt(cols, "s"), { column: 0, row: 0 })
+  assert.equal(overlayCursorAt(cols, "нет такой"), null)
 })

@@ -920,3 +920,61 @@ export function overlayView(prev, args) {
     }
   }
 }
+
+// Every zone as one left-to-right list of columns: the store's project stacks first, then
+// the three days. The store scrolls horizontally rather than wrapping into rows, and that is
+// what makes this list identical to what is on screen — so `←`/`→` walk columns, `↑`/`↓` walk
+// inside one, and no geometry has to be computed to know where the cursor goes next.
+export function overlayColumns(view) {
+  const columns = view.store.map((g) => ({ zone: "store", key: "store:" + g.key, title: g.title, tasks: g.tasks }))
+  columns.push({ zone: "overdue", key: "overdue", title: "Просрочено", tasks: view.overdue })
+  columns.push({ zone: "today", key: "today", title: "Сегодня", tasks: view.today })
+  columns.push({ zone: "tomorrow", key: "tomorrow", title: "Завтра", tasks: view.tomorrow })
+  return columns
+}
+
+// Where the cursor sits, by task id rather than by index: a poll can insert a task above the
+// selected one, and an index would then point at its neighbour.
+export function overlayCursorAt(columns, id) {
+  for (let c = 0; c < columns.length; c++) {
+    const row = columns[c].tasks.findIndex((t) => t.id === id)
+    if (row !== -1) return { column: c, row }
+  }
+  return null
+}
+
+// Moves the cursor and answers with the id it lands on. Empty columns are stepped over
+// rather than entered: a cursor parked in an empty column has nothing to act on, and every
+// subsequent keystroke would appear to do nothing.
+export function moveOverlayCursor(columns, id, dx, dy) {
+  const filled = columns.filter((c) => c.tasks.length > 0)
+  if (filled.length === 0) return ""
+  const at = overlayCursorAt(filled, id)
+  if (!at) return filled[0].tasks[0].id
+  if (dy !== 0) {
+    const tasks = filled[at.column].tasks
+    // Stops at the ends instead of wrapping: wrapping past the last card of a day column
+    // lands on its first one, which reads as the cursor having not moved at all.
+    const row = Math.max(0, Math.min(tasks.length - 1, at.row + dy))
+    return tasks[row].id
+  }
+  if (dx !== 0) {
+    const column = Math.max(0, Math.min(filled.length - 1, at.column + dx))
+    const tasks = filled[column].tasks
+    return tasks[Math.min(at.row, tasks.length - 1)].id
+  }
+  return id
+}
+
+// The cursor after the view changed underneath it: keep the same task while it is still
+// somewhere on screen, otherwise fall back to the nearest card in the column it was in — the
+// case that matters is a card the user just moved out of the store.
+export function overlayCursorAfter(columns, id, previousColumns) {
+  if (id && overlayCursorAt(columns, id)) return id
+  const was = previousColumns ? overlayCursorAt(previousColumns, id) : null
+  const filled = columns.filter((c) => c.tasks.length > 0)
+  if (filled.length === 0) return ""
+  if (!was) return filled[0].tasks[0].id
+  const column = filled[Math.min(was.column, filled.length - 1)]
+  return column.tasks[Math.min(was.row, column.tasks.length - 1)].id
+}

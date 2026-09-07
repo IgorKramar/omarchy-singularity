@@ -280,6 +280,9 @@ Item {
   function complete(id) { return root.enqueueMutation("complete", id, "") }
   function rename(id, title) { return root.enqueueMutation("rename", id, title) }
   function add(title) { return root.enqueueMutation("create", "", title) }
+  // The overlay's write. The zone travels in the same payload field a title uses — the entry
+  // has one, and the operation says how to read it (Api.mutationBody).
+  function move(id, zone) { return root.enqueueMutation("move", id, zone) }
 
   Process {
     id: mutationProc
