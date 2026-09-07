@@ -14,6 +14,7 @@ Item {
   property int count: 0
   property var tasks: []
   property string cursorId: ""
+  property string expandedId: ""
   property var service: null
   property bool acceptsDrop: true
 
@@ -105,8 +106,15 @@ Item {
         width: ListView.view.width
         task: modelData
         hasCursor: modelData.id === root.cursorId
+        expanded: modelData.id === root.expandedId
+        checklist: root.service && root.expandedId === modelData.id
+          ? root.service.checklistFor(modelData.id) : []
+        pendingItems: root.service ? root.service.checklistPending : []
         sending: root.service ? root.service.pendingIds.indexOf(modelData.id) !== -1 : false
         onActivated: root.cardActivated(modelData.id)
+        onItemToggled: function(itemId) {
+          if (root.service) root.service.toggleChecklistItem(modelData.id, itemId)
+        }
       }
     }
   }

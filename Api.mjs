@@ -978,3 +978,61 @@ export function overlayCursorAfter(columns, id, previousColumns) {
   const column = filled[Math.min(was.column, filled.length - 1)]
   return column.tasks[Math.min(was.row, column.tasks.length - 1)].id
 }
+
+// --- Checklists (SNG-4, U8) ---
+//
+// Items live in their own resource and do not travel with the task, so they are fetched when
+// a card is opened rather than for every card in the window — one request for the card
+// someone actually looked at, instead of two hundred nobody asked for.
+//
+// Measured against the live API: the answer is keyed `checklistItems`, an item carries
+// `done` and, unlike a task, a working `removed` flag. `/check` and `/uncheck` answer with
+// the item itself.
+export const CHECKLIST_FIELDS = ["id", "parent", "title", "done", "parentOrder", "removed"]
+
+export function checklistQuery(taskId) {
+  return { "parent.eq": String(taskId), maxCount: MAX_COUNT, fields: CHECKLIST_FIELDS.join(",") }
+}
+
+export const CHECKLIST_MUTATIONS = {
+  check: (id) => ({ method: "POST", path: "/v2/checklist-item/" + encodeURIComponent(id) + "/check" }),
+  uncheck: (id) => ({ method: "POST", path: "/v2/checklist-item/" + encodeURIComponent(id) + "/uncheck" })
+}
+
+// `done` is read as an explicit true, never as truthiness: an item whose field never arrived
+// is not a done item, and `undefined` would draw the same empty box as `false` while meaning
+// something else entirely.
+function normalizeChecklistItem(raw) {
+  return {
+    id: String(raw.id),
+    parent: raw.parent ? String(raw.parent) : "",
+    title: String(raw.title || ""),
+    done: raw.done === true,
+    order: typeof raw.parentOrder === "number" ? raw.parentOrder : 0
+  }
+}
+
+export function parseChecklist(text) {
+  const data = parseJson(text)
+  if (!data || !Array.isArray(data.checklistItems)) throw new Error("response has no checklistItems array")
+  return data.checklistItems
+    .filter((raw) => raw && raw.removed !== true)
+    .map(normalizeChecklistItem)
+    // Their own order, then id — the same tie-break as the task list, and for the same
+    // reason: equal keys must not let the server's answer order decide what the user sees.
+    .sort((a, b) => a.order - b.order || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+}
+
+// Which way this click goes. Asked here because the answer depends on state that is easy to
+// read backwards, and pressing "check" on a checked item is a silent no-op.
+export function checklistToggleOp(item) {
+  return item && item.done ? "uncheck" : "check"
+}
+
+// Same quiet gate as everywhere else: an unchanged list keeps its reference so the card does
+// not rebuild under the cursor.
+export function mergeChecklist(prev, items) {
+  const same = Array.isArray(prev) && prev.length === items.length
+    && prev.every((it, i) => it.id === items[i].id && it.done === items[i].done && it.title === items[i].title)
+  return same ? prev : items
+}

@@ -18,12 +18,16 @@ Item {
   // hope and moving it back on failure is two lies where one wait would do.
   property bool sending: false
   property bool movable: true
+  property bool expanded: false
+  property var checklist: []
+  property var pendingItems: []
   property color foreground: Color.menu.text
   property string fontFamily: Style.font.family
 
   signal activated()
   signal dragStarted()
   signal dragFinished()
+  signal itemToggled(string itemId)
 
   readonly property color dim: Qt.darker(foreground, 1.7)
   // The scale is inverted in this API (0 = high), which is why the question is asked in
@@ -38,6 +42,7 @@ Item {
   readonly property bool hot: hover.hovered
 
   implicitHeight: Math.max(Style.space(26), body.implicitHeight + Style.space(10))
+    + (root.expanded ? checklistBox.implicitHeight + Style.space(6) : 0)
 
   Rectangle {
     id: plate
@@ -58,7 +63,8 @@ Item {
     id: body
     anchors.left: parent.left
     anchors.right: parent.right
-    anchors.verticalCenter: parent.verticalCenter
+    anchors.top: parent.top
+    anchors.topMargin: Style.space(5)
     anchors.leftMargin: Style.space(7)
     anchors.rightMargin: Style.space(7)
     spacing: Style.space(5)
@@ -98,6 +104,71 @@ Item {
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
+    }
+  }
+
+  // The checklist, drawn only while this card is the open one. Items are fetched on
+  // expansion, so an empty list here means "not loaded yet" as often as "no items" — hence
+  // the two different words below.
+  Column {
+    id: checklistBox
+    visible: root.expanded
+    anchors.top: body.bottom
+    anchors.topMargin: Style.space(5)
+    anchors.left: parent.left
+    anchors.right: parent.right
+    anchors.leftMargin: Style.space(9)
+    anchors.rightMargin: Style.space(7)
+    spacing: Style.space(3)
+
+    Text {
+      visible: root.checklist.length === 0
+      text: "нет пунктов"
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    Repeater {
+      model: root.expanded ? root.checklist : []
+      delegate: Item {
+        required property var modelData
+        width: checklistBox.width
+        height: itemLabel.implicitHeight + Style.space(3)
+
+        readonly property bool itemPending: root.pendingItems.indexOf(modelData.id) !== -1
+
+        Text {
+          id: itemMark
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          // A box that is empty, ticked, or waiting — three states, three glyphs, so
+          // "sent" never looks like "not done".
+          text: itemPending ? "◌" : modelData.done ? "☑" : "☐"
+          color: modelData.done ? Color.accent : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        Text {
+          id: itemLabel
+          anchors.left: itemMark.right
+          anchors.leftMargin: Style.space(4)
+          anchors.right: parent.right
+          text: modelData.title
+          color: modelData.done ? root.dim : root.foreground
+          textFormat: Text.PlainText
+          elide: Text.ElideRight
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.strikeout: modelData.done
+        }
+
+        MouseArea {
+          anchors.fill: parent
+          onClicked: root.itemToggled(modelData.id)
+        }
+      }
     }
   }
 

@@ -86,6 +86,8 @@ Item {
       root.status = "no-token"
       root.errorText = ""
       root.cachedTasks = []
+      root.checklists = ({})
+      root.checklistPending = []
       root.allTasks = []
       root.tasks = []
       root.projects = []
@@ -275,6 +277,111 @@ Item {
     for (var i = 0; i < root.cachedTasks.length; i++)
       if (root.cachedTasks[i].id === id) return root.cachedTasks[i]
     return undefined   // absent from the cache: unknown shape, and mutationAllowed refuses
+  }
+
+  // ---- checklists (SNG-4) ------------------------------------------------
+  //
+  // A path of its own, deliberately apart from the task queue. An answer from
+  // /v2/checklist-item/{id}/check is an *item*, and the queue's handler feeds every answer
+  // through parseTask into the task cache: an item has an id, so it would parse, become a
+  // plausible task, and land in the window. The two also share no id space — pendingIds
+  // would mix item ids with task ids.
+  property var checklists: ({})        // task id -> items, filled on demand
+  property var checklistPending: []    // item ids currently in flight
+  property string checklistError: ""
+
+  signal checklistChanged(string taskId)
+
+  function checklistFor(taskId) {
+    var box = root.checklists[taskId]
+    return box ? box : []
+  }
+
+  function loadChecklist(taskId) {
+    if (root.apiToken === "" || !taskId || checklistProc.running) return false
+    checklistProc.taskId = taskId
+    checklistProc.issuedToken = root.apiToken
+    root.runAuthedCurl(checklistProc, Api.buildUrl("/v2/checklist-item", Api.checklistQuery(taskId)))
+    return true
+  }
+
+  function toggleChecklistItem(taskId, itemId) {
+    if (root.apiToken === "" || !itemId || checklistMutProc.running) return false
+    if (root.checklistPending.indexOf(itemId) !== -1) return false
+    var list = root.checklistFor(taskId)
+    var current
+    for (var i = 0; i < list.length; i++) if (list[i].id === itemId) current = list[i]
+    if (!current) return false
+    var op = Api.checklistToggleOp(current)
+    var spec = Api.CHECKLIST_MUTATIONS[op](itemId)
+    checklistMutProc.taskId = taskId
+    checklistMutProc.itemId = itemId
+    checklistMutProc.issuedToken = root.apiToken
+    root.checklistPending = root.checklistPending.concat([itemId])
+    root.checklistError = ""
+    root.runAuthedRequest(checklistMutProc, Api.BASE_URL + spec.path, spec.method, null)
+    return true
+  }
+
+  function finishChecklistItem(itemId) {
+    root.checklistPending = root.checklistPending.filter(function(x) { return x !== itemId })
+  }
+
+  Process {
+    id: checklistProc
+    property string taskId: ""
+    property string issuedToken: ""
+    stdout: StdioCollector { id: checklistOut; waitForEnd: true }
+    stderr: StdioCollector { id: checklistErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var taskId = checklistProc.taskId
+      if (root.apiToken !== checklistProc.issuedToken) return
+      if (exitCode !== 0) {
+        var msg = String(checklistErr.text || "").trim()
+        root.checklistError = msg !== "" ? msg : "curl exited with code " + exitCode
+        root.checklistChanged(taskId)
+        return
+      }
+      var parsed
+      try {
+        parsed = Api.parseChecklist(checklistOut.text)
+      } catch (e) {
+        root.checklistError = String(e.message || e)
+        root.checklistChanged(taskId)
+        return
+      }
+      var box = {}
+      for (var key in root.checklists) box[key] = root.checklists[key]
+      box[taskId] = Api.mergeChecklist(root.checklists[taskId], parsed)
+      root.checklists = box
+      root.checklistError = ""
+      root.checklistChanged(taskId)
+    }
+  }
+
+  Process {
+    id: checklistMutProc
+    property string taskId: ""
+    property string itemId: ""
+    property string issuedToken: ""
+    stdout: StdioCollector { id: checklistMutOut; waitForEnd: true }
+    stderr: StdioCollector { id: checklistMutErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var taskId = checklistMutProc.taskId
+      var itemId = checklistMutProc.itemId
+      root.finishChecklistItem(itemId)
+      if (root.apiToken !== checklistMutProc.issuedToken) return
+      if (exitCode !== 0) {
+        var msg = String(checklistMutErr.text || "").trim()
+        root.checklistError = msg !== "" ? msg : "curl exited with code " + exitCode
+        root.checklistChanged(taskId)
+        return
+      }
+      // The answer is the item, but re-reading the list is one request either way and keeps
+      // one parser instead of two.
+      root.checklistError = ""
+      root.loadChecklist(taskId)
+    }
   }
 
   function complete(id) { return root.enqueueMutation("complete", id, "") }

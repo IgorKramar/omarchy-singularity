@@ -6,8 +6,9 @@
 ![Omarchy](https://img.shields.io/badge/Omarchy-shell%20plugin-7aa2f7)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
-> **Status: in development.** The bar pill, the popup and the headless service work, and the
-> popup completes, renames and adds tasks. The overlay is not built yet.
+> **Status: in development.** The bar pill, the popup and the headless service work, the popup
+> completes, renames and adds tasks, and the overlay sorts the backlog into days. Habits and
+> time tracking are not built yet.
 
 ## What it will be
 
@@ -17,7 +18,7 @@ One plugin, three surfaces, one source of truth:
 | --- | --- | --- |
 | Bar pill | `bar-widget` | count of today's and overdue tasks |
 | Popup | `bar-widget` | tasks grouped by project, three tabs, full keyboard control, complete / rename / add |
-| Overlay | `overlay` | full screen: Overdue / Today / Tomorrow columns, checklists, habits with streaks, time tracking |
+| Overlay | `overlay` | full screen: the undated store plus Overdue / Today / Tomorrow, drag or keys to plan, checklists |
 
 All API work — token, polling, cache — lives in a headless `service`. The bar widget and the overlay only render what the service holds, so the two never disagree.
 
@@ -104,6 +105,47 @@ delivers `h`/`l` and the horizontal arrows as one signal: horizontal carries one
 The selection is held by task, not by row number — a task arriving above it does not shift it.
 When the selected task leaves the window, the selection moves to the next task in its own
 section, then the previous one, then the section header.
+
+## The overlay
+
+The popup answers "what is on today". The overlay answers the other question: **what to do
+with everything that has no date at all.** In this account that is 188 tasks out of 192 —
+the popup never shows them, and they are the whole point of planning.
+
+```bash
+omarchy-shell shell toggle io.github.igorkramar.singularity '{}'
+```
+
+It opens full screen on the monitor with focus. `Esc`, a click outside, or the same command
+closes it. A hotkey and a menu entry come with SNG-6.
+
+Four zones, left to right: the **store** — every unfinished task with no start date, in
+stacks by project, biggest stack first — then **Overdue**, **Today** and **Tomorrow**.
+Tasks starting later than tomorrow are held in the cache but drawn in none of the columns.
+
+Move a card by dragging it into a column, or with the keyboard:
+
+| Key | What it does |
+| --- | --- |
+| `↑` `↓` `←` `→` (or `k` `j` `h` `l`) | move the cursor; columns are one continuous field |
+| `1` | send the card to **Today** |
+| `2` | send it to **Tomorrow** |
+| `0` | clear the date — back to the store |
+| `Enter` / `Space` | open the card's checklist |
+| `Esc` | close |
+
+Zones live on the digits rather than on letters because the shell's key dispatcher resolves
+`h` `j` `k` `l` as arrows, `x` as delete and `Space` as activate before a letter ever reaches
+the plugin. Digits also sit in the same place in both layouts, so unlike the popup's letter
+commands they need no Cyrillic twins. Nothing is ever moved into the past: **Overdue** takes
+no drops and has no key.
+
+Checklist items are fetched when a card is opened — one request for the card you looked at,
+not two hundred for the ones you did not — and are ticked with the mouse.
+
+**The pill does not change when the overlay does.** The overlay works from the whole cache;
+the pill and the popup keep the narrow "up to the end of today" window they always had. So
+sending a task to Tomorrow leaves the count alone, and sending one to Today raises it by one.
 
 ## Requirements
 

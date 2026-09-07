@@ -26,6 +26,36 @@ Item {
   property var targetScreen: null
   property string tab: "tasks"
   property string cursorId: ""
+  // At most one card open at a time: the checklist is a detail view, and two of them side by
+  // side is a list of lists.
+  property string expandedId: ""
+  // What the footer says right now. Set when a write is refused before it leaves — those
+  // refusals are silent otherwise, and R6 forbids a list that changes its mind quietly.
+  property string notice: ""
+
+  // Wording follows the popup's, from the same classifier: the service stores whatever curl
+  // wrote to stderr, and that text never reaches the interface.
+  readonly property string writeError: {
+    var raw = root.service ? String(root.service.mutationError || "") : ""
+    if (raw === "" ) return ""
+    var cls = Api.errorClass(raw)
+    if (cls === "auth") return "Не сохранено: токен не принят"
+    if (cls === "network") return "Не сохранено: сервис не отвечает"
+    if (cls === "response") return "Не сохранено: ответ в неожиданном виде"
+    return "Не сохранено"
+  }
+
+  readonly property string loadError: {
+    var raw = root.service ? String(root.service.errorText || "") : ""
+    if (raw === "") return ""
+    var cls = Api.errorClass(raw)
+    if (cls === "auth") return "Токен не принят — список показан прежний"
+    if (cls === "network") return "Сервис не отвечает — список показан прежний"
+    return "Запрос не прошёл — список показан прежний"
+  }
+
+  readonly property string footerText: root.notice !== "" ? root.notice
+    : root.writeError !== "" ? root.writeError : root.loadError
 
   implicitWidth: 0
   implicitHeight: 0
@@ -92,6 +122,16 @@ Item {
     root.cursorId = Api.moveOverlayCursor(root.columns, root.cursorId, dx, dy)
   }
 
+  // Enter and Space both arrive as activateRequested; the key catcher resolves them to the
+  // same signal, so they do the same thing by construction rather than by agreement.
+  function toggleExpanded(id) {
+    if (!id) return
+    if (root.expandedId === id) { root.expandedId = ""; return }
+    root.expandedId = id
+    if (root.service && typeof root.service.loadChecklist === "function")
+      root.service.loadChecklist(id)
+  }
+
   function stepTab(direction) {
     // One tab today. Habits and time arrive with SNG-5 and step in here; until then the
     // walk has nowhere to go, and saying so beats pretending the key is broken.
@@ -103,13 +143,20 @@ Item {
   function moveCursorTask(zone) {
     if (root.cursorId === "" || !root.service) return
     if (typeof root.service.move !== "function") return
-    root.service.move(root.cursorId, zone)
+    root.notice = ""
+    // The queue refuses in silence — a repeat of a card already sent, a recurring task whose
+    // schedule a move would rewrite, a task it does not know. Say which, or the keystroke
+    // looks broken.
+    if (!root.service.move(root.cursorId, zone))
+      root.notice = "Перенос не отправлен: задача уже в пути, повторяющаяся или неизвестна"
   }
 
   function taskDropped(taskId, zone) {
     if (!taskId || !root.service || typeof root.service.move !== "function") return
     root.cursorId = taskId
-    root.service.move(taskId, zone)
+    root.notice = ""
+    if (!root.service.move(taskId, zone))
+      root.notice = "Перенос не отправлен: задача уже в пути, повторяющаяся или неизвестна"
   }
 
   Connections {
@@ -146,6 +193,7 @@ Item {
 
       onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
       onTabRequested: function(direction) { root.stepTab(direction) }
+      onActivateRequested: root.toggleExpanded(root.cursorId)
       onCloseRequested: root.dismiss()
       onTextKey: function(text) {
         var zone = Api.resolveZoneKey(text)
@@ -179,7 +227,7 @@ Item {
 
           Row {
             width: parent.width
-            height: parent.height - tabs.height - Style.space(12)
+            height: parent.height - tabs.height - footer.height - Style.space(24)
             spacing: Style.space(16)
 
             // The store: project stacks side by side, scrolling horizontally rather than
@@ -209,8 +257,12 @@ Item {
                     tasks: modelData.tasks
                     zone: "store"
                     cursorId: root.cursorId
+                    expandedId: root.expandedId
                     service: root.service
-                    onCardActivated: function(id) { root.cursorId = id }
+                    onCardActivated: function(id) {
+                      if (root.cursorId === id) root.toggleExpanded(id)
+                      else root.cursorId = id
+                    }
                     onTaskDropped: function(id) { root.taskDropped(id, "store") }
                   }
                 }
@@ -238,13 +290,38 @@ Item {
                   tasks: root.view ? root.view[modelData.zone] : []
                   count: tasks.length
                   cursorId: root.cursorId
+                  expandedId: root.expandedId
                   service: root.service
                   // Nothing is moved into the past.
                   acceptsDrop: modelData.zone !== "overdue"
-                  onCardActivated: function(id) { root.cursorId = id }
+                  onCardActivated: function(id) {
+                    if (root.cursorId === id) root.toggleExpanded(id)
+                    else root.cursorId = id
+                  }
                   onTaskDropped: function(id) { root.taskDropped(id, modelData.zone) }
                 }
               }
+            }
+          }
+
+          // The footer. Empty most of the time — it exists so a refused write cannot pass
+          // for a successful one (R6, AE6).
+          Item {
+            id: footer
+            width: parent.width
+            height: root.footerText === "" ? 0 : notice.implicitHeight + Style.space(6)
+
+            Text {
+              id: notice
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.footerText
+              color: Color.urgent
+              textFormat: Text.PlainText
+              elide: Text.ElideRight
+              width: parent.width
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
             }
           }
         }

@@ -16,6 +16,7 @@ import {
   zoneOf, storeGroups, overlayView, OVERLAY_ZONES,
   resolveZoneKey, buildMoveBody, morningOf,
   overlayColumns, overlayCursorAt, moveOverlayCursor, overlayCursorAfter,
+  checklistQuery, parseChecklist, checklistToggleOp, mergeChecklist, CHECKLIST_MUTATIONS, CHECKLIST_FIELDS,
   MUTATIONS, escapeCurlConfigValue, buildCurlConfig, buildRequestCommand,
   buildCreateBody, buildRenameBody, parseTask
 } from "../Api.mjs"
@@ -1325,4 +1326,64 @@ test("overlayCursorAt находит позицию по id", () => {
   const cols = overlayOf([task({ id: "s", start: null }), task({ id: "t", start: today })])
   assert.deepEqual(overlayCursorAt(cols, "s"), { column: 0, row: 0 })
   assert.equal(overlayCursorAt(cols, "нет такой"), null)
+})
+
+
+// --- Чек-листы (SNG-4, U8) ---
+
+const items = (list) => JSON.stringify({ checklistItems: list })
+const item = (over) => ({ id: "CH-1", parent: "T-1", title: "пункт", done: false, parentOrder: 0, removed: false, ...over })
+
+test("checklistQuery выбирает по родителю", () => {
+  const q = checklistQuery("T-1")
+  assert.equal(q["parent.eq"], "T-1")
+  assert.equal(q.fields, CHECKLIST_FIELDS.join(","))
+})
+
+test("parseChecklist: пустой список — это пустой список, а не ошибка", () => {
+  assert.deepEqual(parseChecklist(items([])), [])
+  assert.throws(() => parseChecklist(JSON.stringify({ tasks: [] })), /checklistItems/)
+})
+
+test("parseChecklist: done читается как явное true", () => {
+  // Пункт без поля — не выполненный пункт. undefined нарисовал бы ту же пустую клетку, что и
+  // false, означая совсем другое: «не знаем».
+  const out = parseChecklist(items([
+    item({ id: "a", done: true }),
+    item({ id: "b", done: false }),
+    item({ id: "c", done: undefined })
+  ]))
+  assert.deepEqual(out.map((i) => i.done), [true, false, false])
+  assert.equal(out.every((i) => typeof i.done === "boolean"), true)
+})
+
+test("parseChecklist: удалённый пункт отбрасывается", () => {
+  // У пунктов, в отличие от задач, removed приходит и работает — проверено живым API.
+  const out = parseChecklist(items([item({ id: "a" }), item({ id: "b", removed: true })]))
+  assert.deepEqual(out.map((i) => i.id), ["a"])
+})
+
+test("parseChecklist: порядок свой, при равном — по id", () => {
+  const out = parseChecklist(items([
+    item({ id: "c", parentOrder: 2 }), item({ id: "a", parentOrder: 1 }), item({ id: "b", parentOrder: 1 })
+  ]))
+  assert.deepEqual(out.map((i) => i.id), ["a", "b", "c"])
+})
+
+test("checklistToggleOp и пути отметки различаются", () => {
+  assert.equal(checklistToggleOp({ done: false }), "check")
+  assert.equal(checklistToggleOp({ done: true }), "uncheck")
+  assert.equal(checklistToggleOp(undefined), "check")
+  const on = CHECKLIST_MUTATIONS.check("CH-1"), off = CHECKLIST_MUTATIONS.uncheck("CH-1")
+  assert.notEqual(on.path, off.path, "отметка и снятие адресуют разные пути")
+  assert.match(on.path, /\/check$/)
+  assert.match(off.path, /\/uncheck$/)
+  assert.equal(on.method, "POST")
+})
+
+test("mergeChecklist держит прежнюю ссылку, пока список не изменился", () => {
+  const first = parseChecklist(items([item({ id: "a" })]))
+  assert.equal(mergeChecklist(first, parseChecklist(items([item({ id: "a" })]))), first)
+  assert.notEqual(mergeChecklist(first, parseChecklist(items([item({ id: "a", done: true })]))), first,
+    "отметка изменилась — новый список")
 })
