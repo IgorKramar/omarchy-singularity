@@ -9,7 +9,12 @@ import {
   sliceByTab, groupByProject, hiddenGroups, isCollapsed, flattenGroups,
   moveCursor, cursorIndexForId, popupView,
   errorClass, unmatchedExcluded, emptyReason,
-  toggleKey, isStale, priorityLabel, footerState
+  toggleKey, isStale, priorityLabel, footerState,
+  parseNote, taskFields, recurrenceState, taskWebUrl, WEB_BASE,
+  resolveActionKey, mutationAllowed, shouldDeferPoll, isStalePollResponse, mutationBody,
+  carryRecurrence,
+  MUTATIONS, escapeCurlConfigValue, buildCurlConfig, buildRequestCommand,
+  buildCreateBody, buildRenameBody, parseTask
 } from "../Api.mjs"
 
 // Фиксированный «сейчас»: 3 сентября 2026, полдень, локальная зона машины.
@@ -72,8 +77,11 @@ test("parseTasks: flat list with overdue flag", () => {
     task({ id: "C", start: null })
   ]), now)
   assert.deepEqual(out.map(t => [t.id, t.overdue]), [["A", true], ["B", false], ["C", false]])
+  // Форма кэшируемой задачи закреплена целиком: поле, добавленное в запрашиваемые и
+  // забытое здесь, приходило бы из API и молча пропадало.
   assert.deepEqual(Object.keys(out[0]).sort(),
-    ["checked", "deadline", "deferred", "deleteDate", "id", "modifiedAt", "overdue", "priority", "projectId", "removed", "start", "title"])
+    ["checked", "deadline", "deferred", "deleteDate", "id", "modifiedAt", "note", "overdue",
+     "priority", "projectId", "recurrence", "recurrenceGeneratorId", "removed", "start", "title"])
 })
 
 test("parseTasks throws on non-JSON and on unexpected shape", () => {
@@ -441,10 +449,13 @@ test("cursorIndexForId: ушла последняя в секции — курс
   assert.equal(cursorIndexForId(emptied, "task:A", 1, "P-1"), 0)
 })
 
-test("cursorIndexForId: пустой список снимает курсор, исчезнувшая секция — откат на индекс", () => {
+test("cursorIndexForId: пустой список и исчезнувшая секция одинаково снимают курсор", () => {
   assert.equal(cursorIndexForId([], "task:A", 1, "P-1"), -1)
   const noSection = [{ kind: "header", id: "h:P-9", key: "P-9" }, { kind: "task", id: "task:Z", key: "P-9" }]
-  assert.equal(cursorIndexForId(noSection, "task:A", 1, "P-1"), 1)
+  // Переписано в SNG-3.1: прежде здесь ожидался откат на индекс, то есть посадка
+  // курсора на строку чужого проекта. С появлением действий над задачей это стало бы
+  // правкой не той задачи.
+  assert.equal(cursorIndexForId(noSection, "task:A", 1, "P-1"), -1)
   assert.equal(cursorIndexForId(noSection, "task:A", -1, "P-1"), -1)
 })
 
@@ -606,4 +617,339 @@ test("emptyReason молчит при ошибке с непустым кэше�
   assert.equal(emptyReason("error", 3, 0, 2), "",
     "список есть — место сообщению об ошибке в подвале, а не поверх списка")
   assert.equal(emptyReason("error", 0, 0, 0), "error")
+})
+
+// ---- U1: закрытие резидуалов SNG-3 ---------------------------------------
+
+test("flattenGroups замечает подмену объекта секции при тех же ключе и задачах", () => {
+  // Резидуал 4. Строка несёт ссылку на секцию; действие пойдёт по ней.
+  // Ключ у заголовка вшит в идентификатор, поэтому сравнивать надо объект.
+  const tasks = [t("A", { projectId: "P-1" })]
+  const first = groupByProject(null, tasks, projectsFixture)
+  const flatFirst = flattenGroups(null, first, [])
+  // Меняем только название: состав плоского списка тот же, поэтому сравнение
+  // обязано дойти до самого объекта секции. Смена hidden не годится — она меняет
+  // число строк, и тест позеленел бы, не проверив ничего.
+  const moved = [{ ...first[0], title: "Огород" }]
+  const flatMoved = flattenGroups(flatFirst, moved, [])
+  assert.notEqual(flatMoved, flatFirst,
+    "строка не должна нести ссылку на вытесненную секцию")
+  assert.equal(flatMoved[0].group, moved[0])
+})
+
+test("cursorIndexForId снимает курсор, когда от его секции не осталось строк", () => {
+  // Резидуал 5. Клампинг сажал курсор на строку чужого проекта; после мутации
+  // это стало бы правкой не той задачи.
+  const gone = [
+    { kind: "header", id: "h:P-9", key: "P-9" },
+    { kind: "task", id: "task:Z", key: "P-9" }
+  ]
+  assert.equal(cursorIndexForId(gone, "task:A", 1, "P-1"), -1,
+    "ни заголовок, ни задача чужой секции курсору не годятся")
+  assert.equal(cursorIndexForId(gone, "task:A", 0, "P-1"), -1)
+})
+
+test("cursorIndexForId сохраняет прежнее поведение там, где секция уцелела", () => {
+  const alive = [
+    { kind: "header", id: "h:P-1", key: "P-1" },
+    { kind: "task", id: "task:A", key: "P-1" },
+    { kind: "task", id: "task:C", key: "P-1" }
+  ]
+  assert.equal(cursorIndexForId(alive, "task:C", 1, "P-1"), 2, "находит по идентификатору")
+  assert.equal(cursorIndexForId(alive, "task:B", 2, "P-1"), 2, "откат вперёд внутри секции")
+  assert.equal(cursorIndexForId(alive, "task:B", 3, "P-1"), 2, "откат назад внутри секции")
+  assert.equal(cursorIndexForId(alive, "task:A", 1, "P-1"), 1)
+})
+
+// ---- U2: подробности задачи ----------------------------------------------
+
+test("parseNote различает три исхода, а не два", () => {
+  // Перевод строки внутри значения приходит экранированным — так его шлёт API.
+  assert.deepEqual(parseNote('[{"insert":"Оцинкованные, 4×40.\\n"}]'),
+    { text: "Оцинкованные, 4×40.\n", state: "ok" })
+  assert.deepEqual(parseNote('[{"insert":"строка один\\n"},{"insert":"строка два"}]'),
+    { text: "строка один\nстрока два", state: "ok" })
+  assert.deepEqual(parseNote(""), { text: "", state: "empty" })
+  assert.deepEqual(parseNote("   "), { text: "", state: "empty" })
+  assert.deepEqual(parseNote(undefined), { text: "", state: "empty" })
+  assert.deepEqual(parseNote(null), { text: "", state: "empty" })
+})
+
+test("parseNote: непустая неразбираемая заметка возвращает исходный текст с признаком", () => {
+  // Пустой текст здесь был бы уверенным неверным ответом: пользователь решил бы,
+  // что заметки нет, тогда как её просто не прочитали.
+  // Простой текст — не отказ разбора: так приходят 17 заметок из 192 в живом аккаунте.
+  const plain = "Создать 30-Resources/dacha.md. Контекст: апрель–сентябрь на даче."
+  assert.deepEqual(parseNote(plain), { text: plain, state: "ok" })
+  // А вот это выглядит размеченным и не разбирается — тут пометка уместна.
+  const broken = '[{"insert": "обрыв'
+  assert.deepEqual(parseNote(broken), { text: broken, state: "unparsed" })
+  assert.deepEqual(parseNote('{"insert":"объект вместо массива"}'),
+    { text: '{"insert":"объект вместо массива"}', state: "unparsed" })
+  // Заметка из одной картинки разбирается верно, но текста не даёт. Показ картинок
+  // и разметки план исключает, поэтому для текстовой поверхности она пуста.
+  assert.equal(parseNote('[{"image":"нет текстовых вставок"}]').state, "empty")
+})
+
+test("recurrenceState ловит и генератор, и порождённую задачу", () => {
+  // Форма снята с живой задачи 04.09, а не угадана: у генератора recurrence —
+  // объект при пустом recurrenceGeneratorId, у экземпляра ровно наоборот.
+  const generator = { recurrence: { repeat: { everyday: { interval: 1 } } }, recurrenceGeneratorId: "" }
+  const instance = { recurrence: null, recurrenceGeneratorId: "T-0d647151-dc56-4b3c-89ec-420263827572" }
+  const plain = { recurrence: null, recurrenceGeneratorId: "" }
+  assert.equal(recurrenceState(generator), "recurring")
+  assert.equal(recurrenceState(instance), "recurring",
+    "в окне дня видна именно порождённая задача — предикат по одному recurrence пропустил бы её")
+  assert.equal(recurrenceState(plain), "none")
+})
+
+test("recurrenceState: отсутствие полей даёт «не знаю», а не «обычная»", () => {
+  // Если форма поля изменится и оно перестанет доезжать, отказ обязан быть громким:
+  // «обычная задача» здесь означало бы отправку complete и гашение серии.
+  assert.equal(recurrenceState({ id: "T-1", title: "без полей повтора" }), "unknown")
+  assert.equal(recurrenceState(null), "unknown")
+  assert.equal(recurrenceState({ recurrence: null }), "none", "поле есть и пусто — это ответ")
+})
+
+test("taskFields показывает только заполненное и в постоянном порядке", () => {
+  const full = { start: iso(2026, 8, 3), deadline: iso(2026, 8, 5), priority: 0,
+                 recurrence: null, recurrenceGeneratorId: "" }
+  assert.deepEqual(full.deadline && taskFields(full).map((f) => f.label),
+    ["начало", "дедлайн", "приоритет"])
+  const bare = { start: iso(2026, 8, 3), deadline: null, priority: 1,
+                 recurrence: null, recurrenceGeneratorId: "" }
+  assert.deepEqual(taskFields(bare).map((f) => f.label), ["начало"],
+    "ни дедлайна, ни обычного приоритета в списке быть не должно")
+  assert.deepEqual(taskFields(null), [])
+})
+
+test("taskFields называет повтор отдельной строкой", () => {
+  const rec = { start: iso(2026, 8, 3), deadline: null, priority: 1,
+                recurrence: null, recurrenceGeneratorId: "T-gen" }
+  assert.deepEqual(rec && taskFields(rec).map((f) => f.label), ["начало", "повтор"])
+})
+
+test("taskWebUrl различает исходы и кодирует идентификатор", () => {
+  const withProject = taskWebUrl({ id: "T-1", projectId: "P-1341d38e" })
+  assert.equal(withProject.kind, "project")
+  assert.ok(withProject.url.startsWith(WEB_BASE + "/#/project/"))
+  assert.ok(withProject.url.startsWith("https://"), "наружу уходит только https")
+
+  const noProject = taskWebUrl({ id: "T-2", projectId: null })
+  assert.equal(noProject.kind, "app", "исход отличим: это не адрес задачи")
+  assert.equal(taskWebUrl(null).url, WEB_BASE)
+
+  const odd = taskWebUrl({ id: "T-3", projectId: "P /?#&" })
+  assert.ok(!odd.url.includes(" "), "идентификатор процент-кодирован")
+  assert.ok(!odd.url.slice(WEB_BASE.length + 1).includes("#/project/P /"), "пробел не доехал сырым")
+})
+
+test("parseNote: разобранная пустышка — это пустая заметка, а не испорченная", () => {
+  // Живой случай: заметка из одного перевода строки. Разбирается верно и пуста;
+  // пометка «не удалось прочитать» здесь была бы ложной тревогой.
+  assert.deepEqual(parseNote('[{"insert":"\\n"}]'), { text: "", state: "empty" })
+  assert.deepEqual(parseNote('[{"insert":"   "}]'), { text: "", state: "empty" })
+})
+
+// ---- U3: поверхность записи ----------------------------------------------
+
+test("buildRequestCommand не несёт ни токена, ни содержимого", () => {
+  // Главное защитное свойство: /proc/<pid>/cmdline читает всякий процесс в системе.
+  const cmd = buildRequestCommand("https://api.singularity-app.com/v2/task")
+  const joined = cmd.join(" ")
+  assert.ok(!joined.includes("Bearer"), "заголовка авторизации в argv быть не должно")
+  assert.ok(cmd.includes("-K") && cmd.includes("-"), "запрос читается из конфигурации на stdin")
+  assert.deepEqual(cmd.filter((a) => a.startsWith("http")), ["https://api.singularity-app.com/v2/task"])
+})
+
+test("escapeCurlConfigValue закрывает инъекцию через кавычку", () => {
+  assert.equal(escapeCurlConfigValue('с "кавычкой"'), 'с \\"кавычкой\\"')
+  assert.equal(escapeCurlConfigValue("с \\ косой"), "с \\\\ косой")
+  assert.equal(escapeCurlConfigValue('обе \\ и "'), 'обе \\\\ и \\"')
+  // Сырой перевод строки создал бы в конфигурации вторую директиву — на том же
+  // канале, которым едет токен. JSON.stringify его сюда не пропустит, но проволока стоит.
+  assert.throws(() => escapeCurlConfigValue("две\nстроки"), /CR or LF/)
+  assert.throws(() => escapeCurlConfigValue("возврат\rкаретки"), /CR or LF/)
+})
+
+test("buildCurlConfig: название с кавычкой не порождает лишней директивы", () => {
+  const cfg = buildCurlConfig("TOK", "POST", { title: 'а "б" \\ в' })
+  const lines = cfg.trimEnd().split("\n")
+  assert.equal(lines.length, 4, "ровно четыре строки: токен, глагол, тип, тело")
+  assert.ok(lines[0].startsWith('header = "Authorization: Bearer TOK"'))
+  assert.equal(lines[1], 'request = "POST"')
+  assert.ok(lines[3].startsWith('data = "'))
+  // Тело внутри значения — валидный JSON после снятия экранирования конфигурации.
+  const raw = lines[3].slice('data = "'.length, -1).replace(/\\"/g, '"').replace(/\\\\/g, "\\")
+  assert.deepEqual(JSON.parse(raw), { title: 'а "б" \\ в' })
+})
+
+test("buildCurlConfig: читающий запрос остаётся частным случаем без тела", () => {
+  const cfg = buildCurlConfig("TOK", "GET", null)
+  assert.equal(cfg.trimEnd().split("\n").length, 1, "только заголовок авторизации")
+  assert.ok(!cfg.includes("Content-Type"))
+})
+
+test("buildCreateBody кладёт задачу во Входящие на сегодня", () => {
+  const b = buildCreateBody("  купить саморезы  ", now)
+  assert.equal(b.title, "купить саморезы", "название обрезано по краям")
+  assert.match(b.start, /^2026-09-03T09:00:00[+-]\d\d:\d\d$/)
+  assert.ok(!("projectId" in b), "Входящие — это отсутствие проекта, а не проект")
+  assert.equal(buildCreateBody("", now), null)
+  assert.equal(buildCreateBody("   ", now), null)
+  assert.equal(buildCreateBody(null, now), null)
+})
+
+test("buildRenameBody несёт только название", () => {
+  assert.deepEqual(buildRenameBody("  новое имя "), { title: "новое имя" })
+  assert.equal(buildRenameBody("  "), null)
+})
+
+test("MUTATIONS кодирует идентификатор в пути", () => {
+  assert.equal(MUTATIONS.complete("T-1").method, "POST")
+  assert.ok(MUTATIONS.complete("T-1").path.endsWith("/T-1/complete"))
+  assert.equal(MUTATIONS.rename("T-1").method, "PATCH")
+  assert.equal(MUTATIONS.create().path, "/v2/task")
+  assert.ok(!MUTATIONS.complete("T /?#").path.includes(" "), "идентификатор кодируется")
+})
+
+test("parseTask разбирает отклик мутации той же нормализацией, что и опрос", () => {
+  const one = JSON.stringify({ ...task({ checked: 1 }), note: '[{"insert":"текст"}]',
+                               recurrence: null, recurrenceGeneratorId: "" })
+  const t = parseTask(one, now)
+  assert.equal(t.id, "T-1")
+  assert.equal(t.checked, 1)
+  assert.equal(isCurrent(t, now), false, "завершённая выпадает из окна существующим предикатом")
+  assert.throws(() => parseTask("{}", now), /no task/)
+  assert.throws(() => parseTask("не JSON", now), /not JSON/)
+})
+
+test("parseTasks доносит note и recurrence до нормализованной задачи", () => {
+  // Без этого поля пришли бы из API и молча пропали в normalizeTask: заметка пустая
+  // у всех, защита от гашения серии выключена, тесты зелёные.
+  const [t1] = parseTasks(body([{ ...task(), note: '[{"insert":"есть"}]',
+    recurrence: null, recurrenceGeneratorId: "T-gen" }]), now)
+  assert.equal(parseNote(t1.note).text, "есть")
+  assert.equal(recurrenceState(t1), "recurring")
+
+  const [t2] = parseTasks(body([{ ...task(), note: null,
+    recurrence: null, recurrenceGeneratorId: "" }]), now)
+  assert.equal(t2.note, "")
+  assert.equal(recurrenceState(t2), "none")
+})
+
+test("нормализация не выдаёт «не знаю» за «обычную задачу»", () => {
+  // Ответ без поля повтора вовсе — форма изменилась. Отказ обязан быть громким.
+  const [t] = parseTasks(body([{ id: "T-9", title: "без поля", start: today, checked: 0 }]), now)
+  assert.equal(recurrenceState(t), "unknown",
+    "отсутствие поля должно доезжать до предиката, а не подменяться пустой строкой")
+})
+
+test("taskFields отдаёт дату сырой, а не отформатированной", () => {
+  // Формат даты нельзя проверить здесь: движок QML и node расходятся в toLocaleDateString,
+  // и тест бы зеленел на «4 сентября», пока на экране стоит «04.09.2026». Значит здесь
+  // проверяется ровно то, что сюда относится, — что значение уехало наружу нетронутым.
+  const task = { start: iso(2026, 8, 3), deadline: iso(2026, 8, 5), priority: 0,
+                 recurrence: null, recurrenceGeneratorId: "" }
+  const fields = taskFields(task)
+  const start = fields.find((f) => f.label === "начало")
+  assert.equal(start.kind, "date")
+  assert.equal(start.value, task.start, "значение уехало нетронутым")
+  assert.equal(fields.find((f) => f.label === "приоритет").kind, "text")
+})
+
+test("resolveActionKey знает обе раскладки и оба регистра", () => {
+  // Пары по позиции клавиши, а не по букве. Проверяется здесь, потому что промах молчалив:
+  // команда просто не срабатывает, и ровно это уже случилось живьём с `n`.
+  for (const [key, action] of [["e", "rename"], ["у", "rename"], ["E", "rename"], ["У", "rename"],
+                               ["n", "add"], ["т", "add"], ["N", "add"], ["Т", "add"],
+                               ["o", "web"], ["щ", "web"], ["O", "web"], ["Щ", "web"],
+                               ["u", "undo"], ["г", "undo"], ["U", "undo"], ["Г", "undo"]])
+    assert.equal(resolveActionKey(key), action, `клавиша ${key}`)
+  for (const key of ["j", "k", "h", "l", "x", "", " ", "з"])
+    assert.equal(resolveActionKey(key), "", `клавиша ${key} не команда`)
+})
+
+test("mutationAllowed отказывает повторяющейся задаче и незнакомой", () => {
+  const plain = { recurrence: null, recurrenceGeneratorId: "" }
+  const instance = { recurrence: null, recurrenceGeneratorId: "T-gen" }
+  const generator = { recurrence: { freq: "daily" }, recurrenceGeneratorId: "" }
+  assert.equal(mutationAllowed("complete", plain), true)
+  assert.equal(mutationAllowed("complete", instance), false, "экземпляр серии не отмечается")
+  assert.equal(mutationAllowed("complete", generator), false, "генератор тоже")
+  // Задачи нет в кэше — форма неизвестна. Отказ, а не догадка: цена догадки — погашенная серия.
+  assert.equal(mutationAllowed("complete", undefined), false)
+  assert.equal(mutationAllowed("complete", { id: "T-1" }), false, "поля повтора не пришли")
+  // Остальные операции гейт не трогает: переименовать экземпляр серии можно.
+  assert.equal(mutationAllowed("rename", instance), true)
+  assert.equal(mutationAllowed("create", undefined), true)
+})
+
+test("shouldDeferPoll уступает дорогу непустой очереди и летящей записи", () => {
+  assert.equal(shouldDeferPoll(0, ""), false, "тишина — можно опрашивать")
+  assert.equal(shouldDeferPoll(1, ""), true, "в очереди есть запись")
+  assert.equal(shouldDeferPoll(0, "T-1"), true, "запись в полёте")
+  assert.equal(shouldDeferPoll(0, "new"), true, "создание в полёте")
+})
+
+test("isStalePollResponse отбрасывает только отклик строго старше записи", () => {
+  assert.equal(isStalePollResponse(100, 200), true, "начался до записи — мир устарел")
+  assert.equal(isStalePollResponse(300, 200), false)
+  // Граница: одна и та же миллисекунда доказательством устаревания не является,
+  // а лишний отброс стоит целого круга до сервера.
+  assert.equal(isStalePollResponse(200, 200), false)
+  assert.equal(isStalePollResponse(100, 0), false, "записей ещё не было")
+})
+
+test("buildCurlConfig: POST без тела — форма, которой идёт каждая отметка", () => {
+  // Самая частая запись в плагине, и единственная без тела. Раньше проверялись только
+  // GET без тела и POST с телом — то есть ровно не та комбинация, что уходит по нажатию.
+  const cfg = buildCurlConfig("TOK", "POST", null)
+  assert.equal(cfg, 'header = "Authorization: Bearer TOK"\nrequest = "POST"\n')
+  assert.ok(!cfg.includes("Content-Type"), "без тела заголовок типа не нужен")
+  assert.ok(!cfg.includes("data ="), "и строки данных тоже")
+})
+
+test("buildCurlConfig: кавычка и слеш в токене не закрывают значение", () => {
+  // Свойство доказано для тела; токен ходит по тому же каналу и той же строкой конфигурации.
+  const cfg = buildCurlConfig('a"b\\c', "GET", null)
+  assert.equal(cfg, 'header = "Authorization: Bearer a\\"b\\\\c"\n')
+  const value = cfg.slice('header = "'.length, -2)
+  assert.ok(!/(^|[^\\])"/.test(value), "внутри значения не осталось незакрытой кавычки")
+})
+
+test("mutationBody различает «тела нет» и «отправлять нечего»", () => {
+  const now = new Date("2026-09-04T12:00:00+06:00")
+  assert.deepEqual(mutationBody("complete", "", now), { ok: true, body: null },
+    "отметка идёт без тела и это законно")
+  assert.equal(mutationBody("rename", "  ", now).ok, false, "пробельное название не отправляется")
+  assert.equal(mutationBody("create", "", now).ok, false)
+  assert.equal(mutationBody("rename", " Название ", now).body.title, "Название")
+  assert.equal(mutationBody("create", "Новая", now).body.title, "Новая")
+  assert.equal(mutationBody("create", "Новая", now).body.projectId, undefined,
+    "без проекта — это и есть Входящие")
+  assert.throws(() => mutationBody("delete", "x", now), /unknown mutation/,
+    "незнакомая операция обязана падать громко, а не отправлять пустоту")
+})
+
+test("carryRecurrence спасает генератор серии от отклика без правила повтора", () => {
+  // Форма снята с живого API: отклик записи несёт recurrenceGeneratorId и не несёт
+  // recurrence. У генератора правило лежит именно в recurrence, а ссылка пуста — значит
+  // без переноса переименованный генератор вернулся бы обычной задачей с живой галочкой.
+  const generator = { id: "T-1", title: "было", recurrence: { freq: "daily" }, recurrenceGeneratorId: "" }
+  const answer = { id: "T-1", title: "стало", recurrenceGeneratorId: "" }
+  const merged = carryRecurrence(generator, answer)
+  assert.equal(merged.title, "стало", "название из отклика")
+  assert.equal(mutationAllowed("complete", merged), false, "и серия по-прежнему защищена")
+
+  // Экземпляр серии защищён своей ссылкой и без переноса.
+  const instance = { id: "T-2", recurrence: null, recurrenceGeneratorId: "T-1" }
+  assert.equal(mutationAllowed("complete", carryRecurrence(instance, { id: "T-2", recurrenceGeneratorId: "T-1" })), false)
+
+  // Обычная задача остаётся обычной, а отклик с собственным правилом не подменяется прежним.
+  const plain = { id: "T-3", recurrence: null, recurrenceGeneratorId: "" }
+  assert.equal(mutationAllowed("complete", carryRecurrence(plain, { id: "T-3", recurrenceGeneratorId: "" })), true)
+  assert.deepEqual(carryRecurrence(plain, { id: "T-3", recurrence: { freq: "weekly" } }).recurrence,
+    { freq: "weekly" }, "пришедшее правило важнее прежнего")
+  assert.equal(carryRecurrence(undefined, answer), answer, "прежней версии нет — переносить нечего")
 })

@@ -107,6 +107,100 @@ Panel {
     return "Запрос не прошёл"
   }
 
+  // Four states, decided here so the row draws and never judges. "unknown" is not a
+  // shrug: the recurrence field did not arrive, and completing on a guess could
+  // extinguish a repeating series — declining is the only safe answer.
+  function checkStateFor(task) {
+    if (!root.svc) return "unknown"
+    if (root.svc.pendingIds.indexOf(task.id) !== -1) return "pending"
+    return Api.recurrenceState(task)
+  }
+
+  function completeTask(task) {
+    if (!root.svc || !task) return
+    // The recurrence refusal lives in the service now, where the IPC path meets it too.
+    // The row still draws a repeat glyph instead of a checkbox, so this is not the user's
+    // first notice — it is the last line, not the only one.
+    root.svc.complete(task.id)
+  }
+
+  // One expansion at a time: the note is the tallest thing the popup draws, and two of them
+  // open at once turn a list you scan into a page you scroll.
+  property string expandedId: ""
+
+  function toggleExpanded(task) {
+    if (!task) return
+    root.expandedId = root.expandedId === task.id ? "" : task.id
+  }
+
+  // The panel owns which row is being renamed, because the field itself lives two
+  // Repeaters deep and nothing up here can hold a reference to it (KTD12).
+  property string renamingId: ""
+  property string addDraft: ""
+
+  readonly property bool addSending: root.svc && root.svc.mutatingId === "new"
+
+  function startRename(task) {
+    if (!task || !root.svc) return
+    root.expandedId = ""
+    root.renameRefused = false
+    root.renamingId = task.id
+  }
+
+  function cancelRename() {
+    root.renamingId = ""
+    root.renameRefused = false
+    keyCatcher.forceActiveFocus()
+  }
+
+  // The field is never closed on submit: it closes on `mutated`, so a rename that failed
+  // leaves the text where the user can see and retry it. A refusal at the door — no token,
+  // a write already in flight for this task — is reported the same way and also keeps it.
+  function commitRename(task, title) {
+    if (!root.svc || !task || root.renameSending) return
+    if (!root.svc.rename(task.id, title)) root.renameRefused = true
+  }
+
+  function submitAdd() {
+    if (!root.svc || root.addSending) return
+    if (root.addDraft.trim() === "") return
+    root.svc.add(root.addDraft)
+  }
+
+  readonly property bool renameSending: root.svc && root.renamingId !== ""
+    && root.svc.pendingIds.indexOf(root.renamingId) !== -1
+  // Set when the service turned a rename away without sending it; cleared the moment the
+  // user touches the field again, so it reports this attempt and not the previous one.
+  property bool renameRefused: false
+  property double lastKeyCompleteAt: 0
+
+  // Only a confirmed write clears the field or closes the editor. Doing it on submit
+  // would throw away the text on the one path where the user still needs it.
+  Connections {
+    target: root.svc
+    function onMutated(id, op) {
+      if (op === "create") root.addDraft = ""
+      else if (op === "rename" && id === root.renamingId) root.cancelRename()
+    }
+  }
+
+  function openWeb(url) {
+    // execArgv, not a shell string: the URL is built from API data, and the constant
+    // `exec "$@"` keeps it a single argument no matter what it contains.
+    Util.execArgv(["xdg-open", url])
+  }
+
+  // The write path carries its own error text, kept apart from the poll's: one checkbox
+  // that failed to save must not repaint the popup as a broken service.
+  readonly property string mutationPhrase: {
+    if (!root.svc || !root.svc.mutationError) return ""
+    var cls = Api.errorClass(root.svc.mutationError)
+    if (cls === "auth") return "Не сохранено: токен не принят"
+    if (cls === "network") return "Не сохранено: сервис не отвечает"
+    if (cls === "response") return "Не сохранено: ответ в неожиданном виде"
+    return "Не сохранено"
+  }
+
   readonly property var unmatched: Api.unmatchedExcluded(
     root.svc ? root.svc.projects : [], root.svc ? root.svc.excludedProjects : [])
 
@@ -131,6 +225,13 @@ Panel {
     // Named whether or not the list is empty. A failed poll on top of a cache that still
     // has rows is the likeliest failure there is, and without this line the popup shows the
     // stale list beside the time of the last *successful* sync — a screen that looks right.
+    // First, because it is the only line that says what can still be done about what just
+    // happened. A completed task is out of the window the moment the answer lands, and the
+    // next poll is up to ten minutes away.
+    if (root.svc && root.svc.undoableId !== "")
+      parts.push("Отмечено: " + root.svc.undoableTitle + " · u — вернуть")
+    if (root.renameRefused) parts.push("Переименование не отправлено: по этой задаче уже идёт запись")
+    if (root.mutationPhrase !== "") parts.push(root.mutationPhrase)
     if (root.svcStatus === "error") parts.push(root.errorPhrase)
     if (root.updating) parts.push("обновляется")
     else if (root.svc && root.svc.lastSync)
@@ -163,6 +264,13 @@ Panel {
   }
 
   onViewChanged: {
+    // A rename whose row left the list would keep `blocked` raised with nothing focusable:
+    // every key would then vanish and the popup could only be closed with the mouse. The
+    // row can go for reasons the field never sees — a tab switch, a collapsed section, a
+    // poll that dropped the task.
+    if (root.renamingId !== ""
+        && Api.cursorIndexForId(root.view.flat, "task:" + root.renamingId, -1, null) < 0)
+      root.cancelRename()
     if (!root.cursorActive) return
     root.cursorIndex = Api.cursorIndexForId(root.view.flat, root.cursorId,
                                             root.cursorIndex, root.cursorSection)
@@ -186,6 +294,7 @@ Panel {
   function activateCursor() {
     var row = root.cursorRow
     if (row && row.kind === "header") root.toggleSection(row.group)
+    else if (row && row.kind === "task") root.toggleExpanded(row.task)
   }
 
   function selectByHover(id) {
@@ -289,7 +398,25 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
 
+      // Blocked by panel state, not by a reference to the field: the rename field is two
+      // Repeaters deep. While blocked the catcher forwards every key untouched, which is
+      // why each field carries its own Escape.
+      blocked: root.renamingId !== "" || addField.activeFocus
+
       onCloseRequested: root.close()
+      // Letters the catcher does not spend itself: j/k/h/l walk, x deletes, so e/n/o are
+      // free. Which letter means what — and which Cyrillic key sits in the same place —
+      // is decided in Api.mjs, where a test enumerates the pairs; here only the actions
+      // are wired, because only a list of tasks knows what they do.
+      onTextKey: function(text) {
+        var row = root.cursorRow
+        var action = Api.resolveActionKey(text)
+        if (action === "rename" && row && row.kind === "task") root.startRename(row.task)
+        else if (action === "add" && addField.enabled) addField.forceActiveFocus()
+        else if (action === "web" && row && row.kind === "task")
+          root.openWeb(Api.taskWebUrl(row.task).url)
+        else if (action === "undo") root.svc.undoComplete()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       // The catcher folds h/l and the horizontal arrows into one signal, so horizontal
       // carries exactly one meaning — the tabs. Folding sections lives on Enter (KD6).
@@ -302,8 +429,22 @@ Panel {
         root.activateCursor()
       }
       onActivateRequested: {
+        // Enter raised returnRequested first and set the flag; Space raises only this one.
+        // The existing flag therefore already separates the two — no new mechanism needed.
         if (root.suppressNextActivate) { root.suppressNextActivate = false; return }
-        root.activateCursor()
+        var row = root.cursorRow
+        if (row && row.kind === "task") {
+          // Held Space would otherwise walk the list completing tasks: each one leaves the
+          // window, the cursor slides onto the next, and the next repeat takes that one
+          // too. The key repeat cannot be told apart here — the catcher's signal does not
+          // carry it, and Keys has no ignoreAutoRepeat — so the guard is time: nobody aims
+          // at two different tasks a quarter of a second apart.
+          var now = Date.now()
+          if (now - root.lastKeyCompleteAt < 400) return
+          root.lastKeyCompleteAt = now
+          root.completeTask(row.task)
+        }
+        else root.activateCursor()
       }
 
       // ---- Tabs. Three slices of one cache, so switching costs no request.
@@ -457,27 +598,59 @@ Panel {
               Repeater {
                 model: section.collapsed ? [] : section.modelData.tasks
 
-                TaskRow {
-                  id: taskRow
+                // Row and its expansion are one delegate: the block belongs under the row
+                // that owns it, and a Repeater hands out exactly one item per model entry.
+                Column {
+                  id: rowGroup
                   required property var modelData
                   width: section.width
-                  task: modelData
-                  overdue: Api.isOverdue(modelData, root.view.now)
-                  foreground: root.contentForeground
-                  fontFamily: root.contentFontFamily
-                  // By id, not by object identity: the task object reaches this delegate
-                  // through two nested `var` properties, and QML does not promise the same
-                  // reference comes out the far end. The section header above compares keys
-                  // and highlighted correctly while this row, comparing references, stayed
-                  // dark — the cursor was moving all along.
-                  hasCursor: root.cursorRow && root.cursorRow.kind === "task"
-                    && root.cursorRow.id === "task:" + modelData.id
 
-                  onHasCursorChanged: {
-                    if (hasCursor && root.keyboardDrivingCursor) root.ensureVisible(taskRow)
+                  TaskRow {
+                    id: taskRow
+                    width: rowGroup.width
+                    task: rowGroup.modelData
+                    overdue: Api.isOverdue(rowGroup.modelData, root.view.now)
+                    foreground: root.contentForeground
+                    fontFamily: root.contentFontFamily
+                    // By id, not by object identity: the task object reaches this delegate
+                    // through two nested `var` properties, and QML does not promise the same
+                    // reference comes out the far end. The section header above compares keys
+                    // and highlighted correctly while this row, comparing references, stayed
+                    // dark — the cursor was moving all along.
+                    hasCursor: root.cursorRow && root.cursorRow.kind === "task"
+                      && root.cursorRow.id === "task:" + rowGroup.modelData.id
+
+                    onHasCursorChanged: {
+                      if (hasCursor && root.keyboardDrivingCursor) root.ensureVisible(taskRow)
+                    }
+                    checkState: root.checkStateFor(rowGroup.modelData)
+                    onCompleteRequested: root.completeTask(rowGroup.modelData)
+                    onPointerMoved: function(mouse) {
+                      root.notePointerMoved(taskRow, mouse, "task:" + rowGroup.modelData.id)
+                    }
+                    onExpandRequested: root.toggleExpanded(rowGroup.modelData)
+                    renaming: root.renamingId === rowGroup.modelData.id
+                    renameSending: root.svc
+                      && root.svc.pendingIds.indexOf(rowGroup.modelData.id) !== -1
+                    onRenameAccepted: function(t) { root.commitRename(rowGroup.modelData, t) }
+                    onRenameCancelled: root.cancelRename()
                   }
-                  onPointerMoved: function(mouse) {
-                    root.notePointerMoved(taskRow, mouse, "task:" + modelData.id)
+
+                  // Loaded only while open. The block carries a Repeater and parses the
+                  // note, and the "all" tab can hold hundreds of rows — none of which need
+                  // that work done for an expansion nobody opened.
+                  Loader {
+                    width: rowGroup.width
+                    active: root.expandedId === rowGroup.modelData.id
+                    visible: active
+                    sourceComponent: TaskDetails {
+                      width: rowGroup.width
+                      leftPadding: taskRow.titleInset
+                      task: rowGroup.modelData
+                      foreground: root.contentForeground
+                      fontFamily: root.contentFontFamily
+                      onOpenRequested: function(url) { root.openWeb(url) }
+                    }
                   }
                 }
               }
@@ -495,8 +668,47 @@ Panel {
 
         PanelSeparator {
           width: parent.width
-          visible: root.footerText !== ""
           foreground: root.contentForeground
+        }
+
+        // Always present, at the bottom, where a new task goes. `n` puts the cursor here
+        // from anywhere in the list.
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+
+        TextField {
+          id: addField
+          width: parent.width - (root.addSending ? sendingMark.width + Style.space(6) : 0)
+          // readOnly, never `enabled: false`: disabling a focused field takes its focus
+          // away, and `blocked` is keyed on that focus — for half a second the popup would
+          // hand Space back to the list, completing whatever task sat under the cursor.
+          enabled: root.svc && root.svc.apiToken !== ""
+          readOnly: root.addSending
+          placeholderText: root.addSending ? "отправляется…" : "новая задача во Входящие"
+          text: root.addDraft
+          onTextChanged: root.addDraft = text
+          onAccepted: root.submitAdd()
+          // The catcher is blocked while this field has focus, so its own Escape never
+          // fires here; without this the field would keep the keyboard for good.
+          Keys.onEscapePressed: {
+            root.addDraft = ""
+            keyCatcher.forceActiveFocus()
+          }
+        }
+
+          // The same mark the row wears while its own write is in flight. Without it the
+          // half second after Enter looks exactly like a key that did nothing.
+          Text {
+            id: sendingMark
+            anchors.verticalCenter: parent.verticalCenter
+            visible: root.addSending
+            text: "\uf110"
+            color: Color.accent
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            textFormat: Text.PlainText
+          }
         }
 
         Text {

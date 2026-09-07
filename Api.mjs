@@ -7,7 +7,8 @@ export const BASE_URL = "https://api.singularity-app.com"
 export const MAX_COUNT = 1000
 // Sparse field list. `removed` is not an allowed field, deletion shows as `deleteDate`.
 export const TASK_FIELDS = ["id", "title", "projectId", "start", "deadline", "priority",
-  "checked", "deferred", "deleteDate", "modificatedDate"]
+  "checked", "deferred", "deleteDate", "modificatedDate", "note", "recurrence",
+  "recurrenceGeneratorId"]
 // Overlap for modifiedSince: client and server clocks drift, merge is idempotent by id.
 export const INCREMENTAL_OVERLAP_MS = 60_000
 
@@ -89,6 +90,17 @@ function normalizeTask(t, now) {
     deleteDate: t.deleteDate || null,
     removed: t.removed === true,
     modifiedAt: t.modificatedDate || null,
+    // Both fields are carried explicitly, and both must be. normalizeTask builds a fresh
+    // object from named keys and drops everything else, so adding a field to TASK_FIELDS
+    // alone fetches it and then throws it away — an empty note on every task, and a
+    // recurrence guard that never fires, with every test still green.
+    //
+    // `recurrenceGeneratorId` keeps `undefined` when absent rather than collapsing to a
+    // default: recurrenceState reads the field's *presence* to tell "not recurring" from
+    // "the shape we were told about is gone", and a default would erase that difference.
+    note: typeof t.note === "string" ? t.note : "",
+    recurrence: "recurrence" in t ? (t.recurrence || null) : undefined,
+    recurrenceGeneratorId: t.recurrenceGeneratorId,
     overdue: isOverdue({ start }, now)
   }
 }
@@ -126,7 +138,12 @@ export function merge(cache, incoming, now) {
 }
 
 function sameTasks(a, b) {
-  return a.length === b.length && a.every((t, i) => JSON.stringify(t) === JSON.stringify(b[i]))
+  // Reference first: an entry no poll touched keeps its identity through merge's Map, and
+  // that is the common case. Serialising it anyway grew costlier once tasks began carrying
+  // their note — several hundred characters re-encoded per task per poll to prove what the
+  // identity check proves for free.
+  return a.length === b.length
+    && a.every((t, i) => t === b[i] || JSON.stringify(t) === JSON.stringify(b[i]))
 }
 
 // --- Project filter and counters (SNG-2) ---
@@ -314,9 +331,14 @@ export function isCollapsed(group, toggled) {
   return group.hidden ? !has : has
 }
 
+// `group` belongs in here, and by reference. A row carries the section object an
+// action later reads `hidden` off; comparing the section *key* would change nothing,
+// because a header row already embeds its key in `id`. Without the object itself in
+// the comparison the gate can hand back a row pointing at a section the rebuild
+// evicted — harmless while Enter only folds, wrong the moment it edits a task.
 function sameFlat(a, b) {
   return Array.isArray(a) && a.length === b.length
-    && a.every((r, i) => r.id === b[i].id && r.task === b[i].task)
+    && a.every((r, i) => r.id === b[i].id && r.task === b[i].task && r.group === b[i].group)
 }
 
 // The sequence the keyboard walks, in drawing order: a header, then its rows unless the
@@ -357,6 +379,10 @@ export function cursorIndexForId(list, id, fallbackIndex, sectionKey) {
     for (let i = from - 1; i >= 0; i--)
       if (items[i].key === sectionKey && items[i].kind === "task") return i
     for (let i = 0; i < items.length; i++) if (items[i].key === sectionKey) return i
+    // Nothing of the anchor's section survived. Clamping to the old index would put
+    // the cursor on another project's row — a header or a task, both equally wrong —
+    // and the next keystroke would act on it. No cursor is the honest answer.
+    return -1
   }
   if (fallbackIndex === undefined || fallbackIndex < 0) return -1
   return Math.max(0, Math.min(items.length - 1, fallbackIndex))
@@ -458,8 +484,14 @@ export function isStale(lastSync, now, thresholdMs = FRESHNESS_MS) {
 // 0 = HIGH, 1 = NORMAL, 2 = LOW — the API's own scale, and it runs the opposite way round
 // from the guess, which is why it is pinned by a test rather than by a reader's memory.
 // Only the two ends are marked; normal is the silent default.
+//
+// One table, two spellings: the row has no width for a whole word, the expansion has no
+// reason to abbreviate. A second table would be a second place to fix if the scale ever
+// turns out wrong — and this is precisely the fact that was already guessed wrong once.
+const PRIORITY = { 0: { short: "выс", full: "высокий" }, 2: { short: "низ", full: "низкий" } }
+
 export function priorityLabel(priority) {
-  return priority === 0 ? "выс" : priority === 2 ? "низ" : ""
+  return PRIORITY[priority] ? PRIORITY[priority].short : ""
 }
 
 export function isHighPriority(priority) {
@@ -479,4 +511,241 @@ export function footerState(filterApplied, excludedCount, hiddenTaskCount, proje
   if (excludedCount > 0)
     return { kind: "hidden", hiddenTaskCount, unmatched: unmatchedExcluded(projects, excluded) }
   return { kind: "none", hiddenTaskCount: 0, unmatched: [] }
+}
+
+// --- Task detail (SNG-3.1) ---
+
+export const WEB_BASE = "https://web.singularity-app.com"
+
+// The note arrives as a string holding an array of insert operations. Three outcomes,
+// deliberately distinct: nothing to read, read it, and could-not-read. Returning empty
+// text for the third would make an unreadable note look exactly like a task that has
+// none — a confident wrong answer instead of a visible failure.
+export function parseNote(value) {
+  if (typeof value !== "string" || value.trim() === "") return { text: "", state: "empty" }
+  // The field is a union of two shapes, established by running this over all 192 tasks
+  // in the account: 131 arrive as the marked-up array, 17 as plain text. Plain text is a
+  // perfectly readable note, not a parse failure — labelling it "unparsed" would put a
+  // could-not-read mark on notes that read fine. Only a value that *looks* like the
+  // marked-up shape and then fails is genuinely unreadable.
+  const trimmed = value.trim()
+  if (trimmed[0] !== "[" && trimmed[0] !== "{") return { text: value, state: "ok" }
+  let ops
+  try {
+    ops = JSON.parse(value)
+  } catch (e) {
+    return { text: value, state: "unparsed" }
+  }
+  if (!Array.isArray(ops)) return { text: value, state: "unparsed" }
+  const text = ops.map((o) => (o && typeof o.insert === "string" ? o.insert : "")).join("")
+  // Parsed fine and yields no text — an empty note, not an unreadable one. Marking it
+  // unreadable would warn about a note the user simply never filled in. A note holding
+  // only non-text operations lands here too: this surface renders text, and showing
+  // pictures or formatting is out of scope by decision, so there is nothing to display.
+  if (text.trim() === "") return { text: "", state: "empty" }
+  return { text, state: "ok" }
+}
+
+// Only fields that carry a value. 29 of the API's 39 are empty on every task in this
+// account, so rendering them all would be a screen of blank rows. The project is the
+// section header already and is not repeated here.
+export function taskFields(task) {
+  if (!task) return []
+  const out = []
+  // Dates leave here as their raw value with `kind: "date"`, not as formatted text: the
+  // QML engine's toLocaleDateString ignores the Intl options Node honours, so formatting
+  // here prints "04.09.2026" on screen while the test reads "4 сентября" and passes. The
+  // caller formats through Qt.locale, the way the row already formats its deadline.
+  if (task.start) out.push({ label: "начало", value: task.start, kind: "date" })
+  if (task.deadline) out.push({ label: "дедлайн", value: task.deadline, kind: "date" })
+  const p = PRIORITY[task.priority]
+  if (p) out.push({ label: "приоритет", value: p.full, kind: "text" })
+  if (recurrenceState(task) === "recurring") out.push({ label: "повтор", value: "да", kind: "text" })
+  return out
+}
+
+// A recurring task is two objects, not one — established against live data, not guessed.
+// The generator carries `recurrence` as an object with an empty `recurrenceGeneratorId`;
+// each generated instance carries the reverse. Only the instance lands in the day's
+// window, so a predicate that checked `recurrence` alone would pass every task the user
+// can actually click — failing silently, in the dangerous direction.
+//
+// "unknown" is not a shrug: when neither field is present in the parsed task the shape
+// we were told about is gone, and the caller must decline rather than assume "ordinary".
+export function recurrenceState(task) {
+  if (!task) return "unknown"
+  // `in` is the wrong test here: normalizeTask writes both keys unconditionally, so an
+  // absent field arrives as a present key holding `undefined`. Absence is the value, not
+  // the key — the same distinction this function exists to preserve.
+  const hasRule = task.recurrence !== undefined
+  const hasLink = task.recurrenceGeneratorId !== undefined
+  if (!hasRule && !hasLink) return "unknown"
+  if (task.recurrence && typeof task.recurrence === "object") return "recurring"
+  if (typeof task.recurrenceGeneratorId === "string" && task.recurrenceGeneratorId !== "")
+    return "recurring"
+  return "none"
+}
+
+// The web app routes by hash. A per-task route was not established, so the honest
+// fallback is the task's project — and the caller is told which it got, because "opened
+// the project" and "opened the task" must not be indistinguishable to a verifier.
+export function taskWebUrl(task) {
+  if (!task) return { url: WEB_BASE, kind: "app" }
+  if (task.projectId)
+    return { url: WEB_BASE + "/#/project/" + encodeURIComponent(String(task.projectId)), kind: "project" }
+  return { url: WEB_BASE, kind: "app" }
+}
+
+// --- Write surface (SNG-3.1) ---
+
+// Every mutation the popup can issue. The verb and path live here so QML names an
+// operation, never a URL and never an HTTP method.
+export const MUTATIONS = {
+  complete: (id) => ({ method: "POST", path: "/v2/task/" + encodeURIComponent(id) + "/complete" }),
+  // The way back. A completed task leaves the window immediately and the next poll is up
+  // to ten minutes away, so without this a mis-aimed keystroke is unrecoverable from the
+  // popup — which is exactly how it was found.
+  uncomplete: (id) => ({ method: "POST", path: "/v2/task/" + encodeURIComponent(id) + "/uncomplete" }),
+  rename: (id) => ({ method: "PATCH", path: "/v2/task/" + encodeURIComponent(id) }),
+  create: () => ({ method: "POST", path: "/v2/task" })
+}
+
+// curl reads its whole request from a config on stdin, so nothing — not the token, not
+// the title the user typed — reaches `argv`, where `/proc/<pid>/cmdline` would expose it
+// to every process on the machine.
+//
+// A config value is double-quoted, so the value must escape `\` and `"`; an unescaped
+// quote ends the value and the rest of the line becomes curl options on the same channel
+// that carries the token. `applySettings` already rejects a token containing `["\r\n]`
+// for exactly this reason — but a task title is user content, so it gets escaped rather
+// than rejected. Raw CR/LF cannot survive `JSON.stringify`, which encodes them as the
+// two-character `\n`; the guard below is a tripwire for a caller that hand-built a body.
+export function escapeCurlConfigValue(value) {
+  const s = String(value)
+  if (/[\r\n]/.test(s)) throw new Error("curl config value must not contain CR or LF")
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+}
+
+export function buildCurlConfig(token, method, body) {
+  const lines = ['header = "Authorization: Bearer ' + escapeCurlConfigValue(token) + '"']
+  if (method && method !== "GET") lines.push('request = "' + escapeCurlConfigValue(method) + '"')
+  if (body !== undefined && body !== null) {
+    lines.push('header = "Content-Type: application/json"')
+    lines.push('data = "' + escapeCurlConfigValue(JSON.stringify(body)) + '"')
+  }
+  return lines.join("\n") + "\n"
+}
+
+// The command carries only flags and the URL. Kept pure so the "no secret in argv"
+// property is pinned by a test instead of by one look at a process that lives 550 ms.
+export function buildRequestCommand(url) {
+  return ["curl", "-fsS", "--max-time", "15", "-K", "-", url]
+}
+
+// A task created from the popup lands in Входящие — which in SingularityApp is the
+// absence of a project, not a project of that name (verified: none of the 33 projects
+// carries it). Sending no `projectId` is therefore the whole of it.
+const cleanTitle = (v) => String(v == null ? "" : v).trim()
+
+export function buildCreateBody(title, now) {
+  const clean = cleanTitle(title)
+  if (clean === "") return null
+  // Morning of the local day, written the way endOfDay writes its own timestamp: the API
+  // normalises the offset to UTC, so the offset must be the local one, not a hardcoded Z.
+  const d = startOfDay(now)
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T09:00:00${localOffset(d)}`
+  return { title: clean, start: stamp }
+}
+
+export function buildRenameBody(title) {
+  const clean = cleanTitle(title)
+  if (clean === "") return null
+  return { title: clean }
+}
+
+// A mutation answers with the task itself, so the response goes through the same
+// normalisation as a poll — but `parseTasks` wants an array. One task, one entry point.
+export function parseTask(text, now) {
+  const data = parseJson(text)
+  if (!data || typeof data !== "object" || !data.id) throw new Error("response has no task")
+  return normalizeTask(data, now)
+}
+
+// --- Decisions the popup used to make in QML (SNG-3.1 review) ---
+//
+// Everything below decided something inside Panel.qml or Service.qml, where `node --test`
+// cannot reach it. Each one fails silently when wrong — a command that does nothing, a
+// series quietly extinguished, a completed task walking back into the window — which is
+// exactly the boundary AGENTS.md draws: if the error is silent, the decision lives here.
+
+// Physical key position, not letter identity. The tasks in this popup are Russian, so the
+// layout is Russian while reading them, and a command bound to the Latin letter alone goes
+// silent precisely when it is wanted (caught live: `n` typed a «п» into the field). Both
+// cases, because Shift and CapsLock are not a different intent.
+const ACTION_KEYS = {
+  e: "rename", E: "rename", у: "rename", У: "rename",
+  n: "add", N: "add", т: "add", Т: "add",
+  o: "web", O: "web", щ: "web", Щ: "web",
+  u: "undo", U: "undo", г: "undo", Г: "undo"
+}
+
+export function resolveActionKey(text) {
+  return ACTION_KEYS[text] || ""
+}
+
+// May this write be sent at all? Asked at the service boundary rather than in the panel,
+// because the panel is not the only caller: the IPC handler reaches the same POST, and a
+// guard that lives in one caller is not a guard.
+//
+// A recurring task is two objects — a generator and the instances it produces — and
+// completing an instance is not something this API offers. A task that is not in the cache
+// resolves to "unknown" and is refused by construction: declining costs a keystroke,
+// guessing costs a series.
+export function mutationAllowed(op, task) {
+  if (op !== "complete") return true
+  return recurrenceState(task) === "none"
+}
+
+// A poll started now would race a write already in flight. `merge` is last-writer-wins by
+// id with no modified-time comparison, so a poll that began before the checkbox and lands
+// after its response puts the pre-completion task straight back in the window.
+export function shouldDeferPoll(queueLength, mutatingId) {
+  return queueLength > 0 || mutatingId !== ""
+}
+
+// This response left the server before the last write landed, so it describes a world
+// where that write had not happened. Strictly older, not older-or-equal: a response that
+// started in the same millisecond as the mutation finished is not evidence of a stale
+// world, and discarding it would cost a round trip for nothing.
+export function isStalePollResponse(startedAt, lastMutationAt) {
+  return startedAt < lastMutationAt
+}
+
+// What body an operation sends, and whether it may be sent at all — one answer instead of
+// the same three-way branch written twice in Service.qml (once to validate at queue time,
+// once to build at send time). Those two copies could disagree, and the disagreement would
+// show up as a request answered "ok" that was never sent.
+//
+// `complete` has no body and is still valid; a blank title is invalid and has none. Those
+// are different facts, so they do not share the `null` return that once carried both.
+export function mutationBody(op, title, now) {
+  if (op === "complete" || op === "uncomplete") return { ok: true, body: null }
+  const body = op === "create" ? buildCreateBody(title, now)
+    : op === "rename" ? buildRenameBody(title) : undefined
+  if (body === undefined) throw new Error("unknown mutation: " + op)
+  return body === null ? { ok: false, body: null } : { ok: true, body: body }
+}
+
+// A write answers with the whole task — but not quite the whole one. Measured against the
+// live API: the response carries `recurrenceGeneratorId` and omits `recurrence` entirely.
+// For an instance of a series that is harmless (the link field still says "recurring"),
+// but a generator carries the rule and an *empty* link, so a renamed generator would come
+// back looking like an ordinary task, grow a live checkbox, and one click would put out
+// the series. Carry the rule across rather than trust a field that did not travel.
+export function carryRecurrence(prev, next) {
+  if (!prev || !next) return next
+  if (next.recurrence !== undefined || prev.recurrence === undefined) return next
+  const out = Object.assign({}, next)
+  out.recurrence = prev.recurrence
+  return out
 }
