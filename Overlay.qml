@@ -187,7 +187,7 @@ Item {
             // column list the cursor walks (Api.overlayColumns).
             Flickable {
               id: store
-              width: (parent.width - Style.space(16)) * 0.6
+              width: (parent.width - Style.space(16)) * 0.62
               height: parent.height
               contentWidth: storeRow.width
               flickableDirection: Flickable.HorizontalFlick
@@ -202,7 +202,7 @@ Item {
                   model: root.view ? root.view.store : []
                   delegate: ZoneColumn {
                     required property var modelData
-                    width: Style.space(180)
+                    width: Style.space(215)
                     height: storeRow.height
                     title: modelData.title
                     count: modelData.count
@@ -219,7 +219,7 @@ Item {
 
             // The three days.
             Row {
-              width: (parent.width - Style.space(16)) * 0.4
+              width: (parent.width - Style.space(16)) * 0.38
               height: parent.height
               spacing: Style.space(12)
 

@@ -5,6 +5,10 @@ import "Api.mjs" as Api
 
 // One card in the overlay. Smaller than TaskRow — the overlay shows hundreds at once — and
 // carrying the one thing a row never needed: it can be picked up and dropped somewhere else.
+//
+// It draws its own plate rather than sitting on the column's background. With two hundred
+// titles on screen, "where does this card end and the next begin" is the whole of legibility:
+// the first version left the plate to the cursor alone and read as a wall of text.
 Item {
   id: root
 
@@ -21,7 +25,7 @@ Item {
   signal dragStarted()
   signal dragFinished()
 
-  readonly property color dim: Qt.darker(foreground, 1.6)
+  readonly property color dim: Qt.darker(foreground, 1.7)
   // The scale is inverted in this API (0 = high), which is why the question is asked in
   // Api.mjs and not here.
   readonly property bool urgent: task ? Api.isHighPriority(task.priority) : false
@@ -31,44 +35,50 @@ Item {
     return isNaN(d.getTime()) ? "" : d.toLocaleDateString(Qt.locale("ru_RU"), "d MMM")
   }
   readonly property bool dragging: dragHandler.active
+  readonly property bool hot: hover.hovered
 
-  implicitHeight: line.implicitHeight + Style.space(10)
+  implicitHeight: Math.max(Style.space(26), body.implicitHeight + Style.space(10))
 
   Rectangle {
+    id: plate
     anchors.fill: parent
     radius: Style.cornerRadius
+    // Three levels of ground, as in the mock-up: the overlay, the column, and this. Each
+    // step is an alpha over the same foreground, so both themes keep the same ladder.
     color: root.hasCursor ? Style.selectedFillFor(root.foreground, Color.accent)
-      : root.dragging ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
-    border.width: root.hasCursor ? Style.selectedBorderWidth : 0
-    border.color: Style.selectedBorderFor(root.foreground, Color.accent)
-    opacity: root.sending ? 0.5 : 1.0
+      : root.dragging || root.hot ? Style.hoverFillFor(root.foreground, Color.accent)
+      : Style.normalFillFor(root.foreground, Color.accent)
+    border.width: root.hasCursor ? Math.max(1, Style.selectedBorderWidth) : Style.normalBorderWidth
+    border.color: root.hasCursor ? Color.accent
+      : Style.normalBorderFor(root.foreground, Color.accent)
+    opacity: root.sending ? 0.45 : 1.0
   }
 
   Row {
-    id: line
+    id: body
     anchors.left: parent.left
     anchors.right: parent.right
     anchors.verticalCenter: parent.verticalCenter
-    anchors.leftMargin: Style.space(8)
-    anchors.rightMargin: Style.space(8)
-    spacing: Style.space(6)
+    anchors.leftMargin: Style.space(7)
+    anchors.rightMargin: Style.space(7)
+    spacing: Style.space(5)
 
     // Named as well as coloured: the mark still reads without colour vision.
     Text {
+      id: bang
       visible: root.urgent
-      anchors.verticalCenter: parent.verticalCenter
+      anchors.top: parent.top
       text: "!"
       color: Color.urgent
       font.family: root.fontFamily
-      font.pixelSize: Style.font.body
+      font.pixelSize: Style.font.bodySmall
       font.bold: true
     }
 
     Text {
       id: label
-      width: line.width - (root.urgent ? Style.space(12) : 0)
-        - (deadline.visible ? deadline.width + line.spacing : 0)
-      anchors.verticalCenter: parent.verticalCenter
+      width: body.width - (bang.visible ? bang.width + body.spacing : 0)
+        - (deadline.visible ? deadline.width + body.spacing : 0)
       text: root.task ? root.task.title : ""
       color: root.foreground
       // Plain text on purpose: a title carrying markup is a title, not markup.
@@ -77,19 +87,21 @@ Item {
       maximumLineCount: 2
       wrapMode: Text.Wrap
       font.family: root.fontFamily
-      font.pixelSize: Style.font.body
+      font.pixelSize: Style.font.bodySmall
     }
 
     Text {
       id: deadline
       visible: root.deadlineLabel !== ""
-      anchors.verticalCenter: parent.verticalCenter
+      anchors.top: parent.top
       text: root.deadlineLabel
       color: root.dim
       font.family: root.fontFamily
-      font.pixelSize: Style.font.small
+      font.pixelSize: Style.font.caption
     }
   }
+
+  HoverHandler { id: hover }
 
   MouseArea {
     anchors.fill: parent
