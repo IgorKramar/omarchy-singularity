@@ -40,8 +40,11 @@ switching between them never costs a request. "Все" is the whole window, exac
 the pill shows. Overdue is recomputed from the current time rather than read off a flag
 frozen when the response was parsed, so a popup left open across midnight tells the truth.
 
-Opening asks the service for fresh data when the last sync is more than a minute old, and the
-footer says both that an update is running and when the last one landed.
+The service asks for the whole task window every ten minutes on its own, whether the popup is
+open or not, so a task changed or deleted elsewhere — the web app, the phone — is never more
+than ten minutes from showing up here too. Opening the popup asks sooner, when the last sync
+is more than a minute old, so in practice the wait is however long it takes to open the popup.
+The footer says both that an update is running and when the last one landed.
 
 Projects excluded from the count (see below) are not omitted: each appears in its place as a
 dimmed, collapsed section, and opens like any other. The footer says how many **tasks** are
@@ -133,7 +136,7 @@ The service watches the file, so a token placed after the shell started is picke
 
 ```bash
 omarchy-shell singularity status    # {"status":"no-token"|"loading"|"ready"|"error", "errorText":…, "tasks":[…], …}
-omarchy-shell singularity refresh   # force a full fetch
+omarchy-shell singularity refresh   # poll right now, instead of waiting for the next scheduled one
 ```
 
 ### Filtering projects out of the count

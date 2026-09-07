@@ -41,9 +41,12 @@ Item {
   property string apiToken: ""
   property bool inFlight: false
   property bool refreshPending: false
-  property bool fullFetchPending: false
-  property string lastFullFetchDay: ""
-  property double lastRequestStartedAt: 0
+  // Projects, not tasks. Tasks are fetched whole on every poll (SNG-7); these two decide
+  // only whether to also ask for the project list, which changes on the order of weeks.
+  // The flag is the "on demand" half of that rule — a new token, a project filter set before
+  // any project names have arrived, and the `refresh` IPC command each raise it.
+  property bool projectsFetchPending: false
+  property string lastProjectFetchDay: ""
 
   function dayKey(date) {
     return date.getFullYear() + "-" + (date.getMonth() + 1) + "-" + date.getDate()
@@ -84,7 +87,7 @@ Item {
       return
     }
     chmodProc.running = true
-    root.fullFetchPending = true
+    root.projectsFetchPending = true
     root.refresh()
   }
 
@@ -117,7 +120,7 @@ Item {
     // full fetch whose tail carries them.
     if (Api.normalizeExcluded(root.excludedProjects).size > 0
         && root.projects.length === 0 && root.apiToken !== "") {
-      root.fullFetchPending = true
+      root.projectsFetchPending = true
       root.refresh()
     }
     if (root.recompute()) root.changed()
@@ -133,15 +136,10 @@ Item {
       return
     }
     var now = new Date()
-    var today = root.dayKey(now)
-    var full = root.fullFetchPending || root.lastSync === "" || root.lastFullFetchDay !== today
-    var params = full ? Api.todayQuery(now) : Api.incrementalQuery(root.lastRequestStartedAt)
-    root.fullFetchPending = false
     root.inFlight = true
     if (root.status !== "ready") root.status = "loading"   // a background poll keeps `ready`; the quiet gate below depends on it
-    taskProc.full = full
     taskProc.startedAt = now.getTime()
-    root.runAuthedCurl(taskProc, Api.buildUrl("/v2/task", params))
+    root.runAuthedCurl(taskProc, Api.buildUrl("/v2/task", Api.todayQuery(now)))
   }
 
   // The whole request — token, verb, headers, body — goes to curl as a `-K -` config on
@@ -328,7 +326,6 @@ Item {
 
   Process {
     id: taskProc
-    property bool full: false
     property double startedAt: 0
     stdout: StdioCollector { id: taskOut; waitForEnd: true }
     stderr: StdioCollector { id: taskErr; waitForEnd: true }
@@ -344,10 +341,6 @@ Item {
         return
       }
       if (Api.isStalePollResponse(taskProc.startedAt, root.lastMutationAt)) {
-        // The retry must ask for the same thing the discarded request asked for: a full
-        // fetch thrown away here would come back as an increment, and the day's rebuild
-        // would silently not happen until tomorrow.
-        root.fullFetchPending = root.fullFetchPending || taskProc.full
         root.inFlight = false
         root.refreshPending = true
         root.drainPending()
@@ -363,17 +356,19 @@ Item {
       }
       if (incoming.length >= Api.MAX_COUNT)
         console.warn(root.pluginId + ": task list hit maxCount=" + Api.MAX_COUNT + ", the window may be truncated")
-      var next = Api.merge(taskProc.full ? [] : root.allTasks, incoming, now)
+      var next = Api.mergeFull(root.allTasks, incoming, now)
       var quiet = next === root.allTasks && root.status === "ready" && root.errorText === ""
       root.allTasks = next
-      root.lastRequestStartedAt = taskProc.startedAt
       root.lastSync = now.toISOString()
-      if (taskProc.full) root.lastFullFetchDay = root.dayKey(new Date(taskProc.startedAt))   // the query window was built at request start
       root.errorText = ""
       root.status = "ready"
       var visibleChanged = root.recompute()
       if (!quiet || visibleChanged) root.changed()
-      if (taskProc.full) {
+      // Projects are asked for once a local day, or whenever something raised the flag.
+      // Tasks no longer decide this: they are fetched whole every time.
+      if (root.projectsFetchPending || root.lastProjectFetchDay !== root.dayKey(now)) {
+        projectProc.forDay = root.dayKey(new Date(taskProc.startedAt))   // the day the request was built for
+        root.projectsFetchPending = false
         root.runAuthedCurl(projectProc, Api.buildUrl("/v2/project", Api.projectsQuery()))
       } else {
         root.inFlight = false
@@ -386,6 +381,9 @@ Item {
   // but neither changes `status` nor clears the project cache.
   Process {
     id: projectProc
+    // The day this request was built for. Written to the day key only on success, so a
+    // failed project fetch does not claim "already fetched today" and cost a day of names.
+    property string forDay: ""
     stdout: StdioCollector { id: projectOut; waitForEnd: true }
     stderr: StdioCollector { id: projectErr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -400,6 +398,7 @@ Item {
       } else {
         try {
           root.projects = Api.parseProjects(projectOut.text)
+          root.lastProjectFetchDay = projectProc.forDay
         } catch (e) {
           root.errorText = "projects: " + String(e.message || e)
         }
@@ -510,7 +509,7 @@ Item {
     function refresh(): string {
       settingsFile.reload()
       if (root.apiToken === "") return "no-token"
-      root.fullFetchPending = true
+      root.projectsFetchPending = true
       root.refresh()
       return "ok"
     }

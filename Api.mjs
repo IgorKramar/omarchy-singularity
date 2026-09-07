@@ -5,13 +5,14 @@
 export const BASE_URL = "https://api.singularity-app.com"
 // The spec bounds maxCount to 1..1000 and names no default; ask for the maximum.
 export const MAX_COUNT = 1000
-// Sparse field list. `removed` is not an allowed field, deletion shows as `deleteDate`.
+// Sparse field list. Deletion is not in here because the API offers no way to see it:
+// `removed` is rejected as a field (HTTP 400), and a deleted task still answers with
+// `deleteDate: null` — measured against the live API, 2026-09-07. A deleted task is
+// recognised by one thing only: the window query stops returning it. That is why the poll
+// asks for the whole window every time instead of a delta (SNG-7).
 export const TASK_FIELDS = ["id", "title", "projectId", "start", "deadline", "priority",
   "checked", "deferred", "deleteDate", "modificatedDate", "note", "recurrence",
   "recurrenceGeneratorId"]
-// Overlap for modifiedSince: client and server clocks drift, merge is idempotent by id.
-export const INCREMENTAL_OVERLAP_MS = 60_000
-
 const pad = (n) => String(n).padStart(2, "0")
 
 export function localOffset(date) {
@@ -40,13 +41,6 @@ export function endOfDay(now) {
 
 export function todayQuery(now) {
   return { "checked.eq": 0, "start.lte": endOfDay(now), maxCount: MAX_COUNT, fields: TASK_FIELDS.join(",") }
-}
-
-// No server-side "today" filters here: a task that left the window (checked, moved) must still
-// arrive so merge() can drop it. The window is applied on the client in isCurrent().
-export function incrementalQuery(since) {
-  const from = new Date(new Date(since).getTime() - INCREMENTAL_OVERLAP_MS)
-  return { modifiedSince: from.toISOString(), includeRemoved: true, maxCount: MAX_COUNT, fields: TASK_FIELDS.join(",") }
 }
 
 export function projectsQuery() {
@@ -88,7 +82,6 @@ function normalizeTask(t, now) {
     checked: typeof t.checked === "number" ? t.checked : 0,
     deferred: t.deferred === true,
     deleteDate: t.deleteDate || null,
-    removed: t.removed === true,
     modifiedAt: t.modificatedDate || null,
     // Both fields are carried explicitly, and both must be. normalizeTask builds a fresh
     // object from named keys and drops everything else, so adding a field to TASK_FIELDS
@@ -119,7 +112,7 @@ export function parseProjects(text) {
 
 // The "today" predicate: unchecked, alive, not deferred, planned no later than the local end of day.
 export function isCurrent(task, now) {
-  if (task.checked !== 0 || task.removed || task.deleteDate || task.deferred) return false
+  if (task.checked !== 0 || task.deleteDate || task.deferred) return false
   if (!task.start) return false
   return new Date(task.start).getTime() <= endOfDayDate(now).getTime()
 }
@@ -128,13 +121,29 @@ export function isCurrent(task, now) {
 // and increments alike, so the window has exactly one owner.
 // Returns the same `cache` reference when nothing changed, so a QML `var` property
 // assignment does not fire a notify on every quiet poll.
+const byStartThenTitle = (a, b) =>
+  a.start < b.start ? -1 : a.start > b.start ? 1 : a.title.localeCompare(b.title)
+
+// Merges one answer into the cache by id. Used by the write path, where the response is a
+// single task and the rest of the window must survive. The poll uses mergeFull instead.
 export function merge(cache, incoming, now) {
   const byId = new Map(cache.map((t) => [t.id, t]))
   for (const t of incoming) byId.set(t.id, t)
-  const next = [...byId.values()]
-    .filter((t) => isCurrent(t, now))
-    .sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : a.title.localeCompare(b.title)))
+  const next = [...byId.values()].filter((t) => isCurrent(t, now)).sort(byStartThenTitle)
   return sameTasks(cache, next) ? cache : next
+}
+
+// What a full window fetch does with its answer. The set is built from `incoming` alone —
+// the cache does not contribute, which is exactly how a task deleted elsewhere leaves: it
+// simply is not in the answer any more.
+//
+// `prev` is here for one reason: to return *the same reference* when nothing changed. Its
+// absence is what the first draft of SNG-7 missed — calling `merge([], incoming)` would have
+// compared the new set against an empty literal, never matched, and rebuilt the popup every
+// ten minutes with a quiet-gate check in the code that could not fire.
+export function mergeFull(prev, incoming, now) {
+  const next = incoming.filter((t) => isCurrent(t, now)).sort(byStartThenTitle)
+  return sameTasks(prev, next) ? prev : next
 }
 
 function sameTasks(a, b) {

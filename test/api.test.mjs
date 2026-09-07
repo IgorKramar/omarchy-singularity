@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   BASE_URL, MAX_COUNT, TASK_FIELDS,
-  endOfDay, startOfDay, todayQuery, incrementalQuery, projectsQuery,
+  endOfDay, startOfDay, todayQuery, projectsQuery, mergeFull,
   buildUrl, parseTasks, parseProjects, merge, isCurrent,
   isOverdue, normalizeExcluded, applyProjectFilter, countWindow,
   computeView, excludedList,
@@ -27,7 +27,7 @@ const tomorrow = iso(2026, 8, 4)
 const task = (over) => ({
   id: "T-1", title: "task", note: "", priority: 1, projectId: "P-1",
   start: today, deadline: null, checked: 0, deferred: false,
-  deleteDate: null, removed: false, modificatedDate: today, ...over
+  deleteDate: null, modificatedDate: today, ...over
 })
 const body = (tasks) => JSON.stringify({ tasks })
 
@@ -40,15 +40,6 @@ test("todayQuery: unchecked, start.lte end of local day, no deadline filter, exp
   assert.ok(!("deadline.lte" in q) && !("deadline.eq" in q))
   assert.equal(q.fields, TASK_FIELDS.join(","))
   assert.ok(!TASK_FIELDS.includes("removed"))
-})
-
-test("incrementalQuery: modifiedSince shifted 60s back, includeRemoved, no server-side today filters", () => {
-  const since = new Date(2026, 8, 3, 11, 50, 0)
-  const q = incrementalQuery(since)
-  assert.equal(q.modifiedSince, new Date(since.getTime() - 60_000).toISOString())
-  assert.equal(q.includeRemoved, true)
-  assert.equal(q.maxCount, MAX_COUNT)
-  assert.ok(!("checked.eq" in q) && !("start.lte" in q))
 })
 
 test("projectsQuery asks only id and title", () => {
@@ -81,7 +72,7 @@ test("parseTasks: flat list with overdue flag", () => {
   // забытое здесь, приходило бы из API и молча пропадало.
   assert.deepEqual(Object.keys(out[0]).sort(),
     ["checked", "deadline", "deferred", "deleteDate", "id", "modifiedAt", "note", "overdue",
-     "priority", "projectId", "recurrence", "recurrenceGeneratorId", "removed", "start", "title"])
+     "priority", "projectId", "recurrence", "recurrenceGeneratorId", "start", "title"])
 })
 
 test("parseTasks throws on non-JSON and on unexpected shape", () => {
@@ -94,12 +85,12 @@ test("parseProjects: id and title", () => {
     [{ id: "P-1", title: "Work" }])
 })
 
-test("merge: replace by id, drop checked/deleted/removed", () => {
+test("merge: replace by id, drop checked/deleted", () => {
   const cache = parseTasks(body([task({ id: "A" }), task({ id: "B" })]), now)
   const incoming = parseTasks(body([task({ id: "A", checked: 1 }), task({ id: "C" })]), now)
   assert.deepEqual(merge(cache, incoming, now).map(t => t.id).sort(), ["B", "C"])
   assert.deepEqual(merge(cache, parseTasks(body([task({ id: "A", deleteDate: today })]), now), now).map(t => t.id), ["B"])
-  assert.deepEqual(merge(cache, parseTasks(body([task({ id: "A", removed: true })]), now), now).map(t => t.id), ["B"])
+  assert.deepEqual(merge(cache, parseTasks(body([task({ id: "A", deleteDate: "2026-09-03" })]), now), now).map(t => t.id), ["B"])
   const renamed = merge(cache, parseTasks(body([task({ id: "A", title: "renamed" })]), now), now)
   assert.equal(renamed.find(t => t.id === "A").title, "renamed")
 })
@@ -952,4 +943,36 @@ test("carryRecurrence спасает генератор серии от откл
   assert.deepEqual(carryRecurrence(plain, { id: "T-3", recurrence: { freq: "weekly" } }).recurrence,
     { freq: "weekly" }, "пришедшее правило важнее прежнего")
   assert.equal(carryRecurrence(undefined, answer), answer, "прежней версии нет — переносить нечего")
+})
+
+test("mergeFull возвращает ту же ссылку, когда окно не изменилось", () => {
+  // Это и есть тихий гейт. Без него попап перестраивается каждые десять минут, а проверка
+  // `next === allTasks` в QML остаётся в коде, не имея возможности сработать ни при каких
+  // данных — ровно та мёртвая проверка, которую SNG-7 и убирает в другом месте.
+  const answer = () => parseTasks(body([task({ id: "A" }), task({ id: "B" })]), now)
+  const first = mergeFull([], answer(), now)
+  assert.deepEqual(first.map((t) => t.id), ["A", "B"])
+  assert.equal(mergeFull(first, answer(), now), first, "то же содержимое — та же ссылка")
+  const changed = mergeFull(first, parseTasks(body([task({ id: "A", title: "иначе" }), task({ id: "B" })]), now), now)
+  assert.notEqual(changed, first, "изменилось название — новый массив")
+  assert.equal(changed[0].title, "иначе")
+})
+
+test("mergeFull не тащит из кэша то, чего нет в ответе", () => {
+  // Так удалённая вне плагина задача и покидает окно: признака удаления в ответе нет и быть
+  // не может, но её самой в ответе тоже нет.
+  const cache = mergeFull([], parseTasks(body([task({ id: "A" }), task({ id: "B" })]), now), now)
+  const after = mergeFull(cache, parseTasks(body([task({ id: "B" })]), now), now)
+  assert.deepEqual(after.map((t) => t.id), ["B"])
+})
+
+test("mergeFull отсеивает по тому же окну, что и merge", () => {
+  const out = mergeFull([], parseTasks(body([
+    task({ id: "A" }),
+    task({ id: "B", checked: 1 }),
+    task({ id: "C", deferred: true }),
+    task({ id: "D", deleteDate: "2026-09-03" }),
+    task({ id: "E", start: null })
+  ]), now), now)
+  assert.deepEqual(out.map((t) => t.id), ["A"], "завершённая, отложенная, удалённая и без начала — не окно")
 })
