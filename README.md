@@ -1,15 +1,26 @@
-# omarchy-singularity
+<div align="center">
 
-[SingularityApp](https://singularity-app.com/) tasks on the [Omarchy](https://omarchy.org/) desktop.
+# Omarchy × SingularityApp
 
-![ci](https://github.com/IgorKramar/omarchy-singularity/actions/workflows/ci.yml/badge.svg)
-![Omarchy](https://img.shields.io/badge/Omarchy-shell%20plugin-7aa2f7)
-![License](https://img.shields.io/badge/license-MIT-brightgreen)
+**English** · [Русский](README.ru.md)
+
+### Your tasks, one glance away.
+
+[![CI](https://github.com/IgorKramar/omarchy-singularity/actions/workflows/ci.yml/badge.svg)](https://github.com/IgorKramar/omarchy-singularity/actions/workflows/ci.yml)
+![QML](https://img.shields.io/badge/QML-bb9af7?style=flat-square)
+![JavaScript](https://img.shields.io/badge/JavaScript-e0af68?style=flat-square)
+![Quickshell](https://img.shields.io/badge/Quickshell-7aa2f7?style=flat-square)
+[![MIT](https://img.shields.io/badge/license-MIT-9ece6a?style=flat-square)](LICENSE)
+![Status](https://img.shields.io/badge/status-in_development-e0af68?style=flat-square)
+
+[Features](#features-and-roadmap) · [Install](#install) · [Keys](#keyboard) · [Filters](#filtering-projects-out-of-the-count) · [Development](#development)
+
+</div>
 
 > **Status: in development.** The bar pill, the popup and the headless service work, and the
 > popup completes, renames and adds tasks. The overlay is not built yet.
 
-## What it will be
+## Features and roadmap
 
 One plugin, three surfaces, one source of truth:
 
@@ -17,9 +28,9 @@ One plugin, three surfaces, one source of truth:
 | --- | --- | --- |
 | Bar pill | `bar-widget` | count of today's and overdue tasks |
 | Popup | `bar-widget` | tasks grouped by project, three tabs, full keyboard control, complete / rename / add |
-| Overlay | `overlay` | full screen: Overdue / Today / Tomorrow columns, checklists, habits with streaks, time tracking |
+| Overlay — planned | `overlay` | full screen: Overdue / Today / Tomorrow columns, checklists, habits with streaks, time tracking |
 
-All API work — token, polling, cache — lives in a headless `service`. The bar widget and the overlay only render what the service holds, so the two never disagree.
+All API work — token, polling, cache — lives in a headless `service`. The bar widget renders that shared state; the planned overlay is intended to use the same service.
 
 ## The popup
 
@@ -145,7 +156,7 @@ Some projects are noise in a count: annual birthdays, public holidays, anything 
 forever and needs no action today. List them and they stop counting.
 
 The filter is applied by the service, not by the pill, so it holds for every surface of the
-plugin — the popup and the overlay will show the same set the count is taken from.
+plugin — the popup uses the same filtered state, and the planned overlay is intended to do so too.
 
 **Omarchy has no built-in settings screen.** There are two ways to set the list, and the first
 one always works:
@@ -217,8 +228,10 @@ The test file is named explicitly: `node --test` exits 0 when it discovers no te
 a rename would leave the job green at zero checks. `Api.mjs` is a plain ES module shared by
 QML and Node. The `qml` on `PATH` is Qt 5 and cannot load it; use `/usr/lib/qt6/bin/qml` for local QML checks.
 
+CI checks the pure module and the manifest/entry points; it does **not execute QML**. Project terminology is documented in [CONCEPTS.md](CONCEPTS.md).
+
 The API spec is public: <https://api.singularity-app.com/v2/api-json>.
 
 ## License
 
-MIT
+[MIT](LICENSE). Copyright © Igor Kramar.
